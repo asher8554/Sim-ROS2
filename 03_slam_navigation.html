@@ -1,0 +1,314 @@
+<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3장. SLAM · Nav2 주행 · 충돌 회피 · 순찰 데모 | Sim-ROS2</title><link rel="stylesheet" href="assets/style.css"></head>
+<body><!-- 3장 교육자료: SLAM 지도 작성, Nav2 주행, 충돌 회피, 순찰 데모와 웹 대시보드를 압축한 페이지 -->
+<div class="wrap">
+<header class="glass hero"><div class="kicker">Sim-ROS2 · 5장 압축 교육자료 · 3/5</div><h1>3장. SLAM · Nav2 주행 · 충돌 회피 · 순찰 데모</h1><p>SLAM Toolbox로 부스 지도를 만들고, 그 지도 위에서 Nav2로 목표까지 주행하고, 지도에 없는 관람객을 피한 뒤, 순찰 노드와 웹 대시보드로 전반부를 하나로 묶는다. 원본 08~11강.</p></header>
+
+<nav class="glass toc" aria-label="목차"><ol>
+<li><a href="#s1">SLAM Toolbox로 부스 지도 만들기 (08강)</a></li>
+<li><a href="#s2">Nav2로 목표까지 주행 (09강)</a></li>
+<li><a href="#s3">Nav2 충돌 회피: 지도에 없는 관람객 (10강)</a></li>
+<li><a href="#s4">전반부 통합 Demo: 부스 순찰과 웹 대시보드 (11강)</a></li>
+<li><a href="#s5">정리</a></li>
+</ol></nav>
+
+<main>
+
+<!-- ───────────── 08 SLAM ───────────── -->
+<section class="glass card" id="s1">
+<h2>1. SLAM Toolbox로 부스 지도 만들기</h2>
+
+<h3>핵심 개념</h3>
+<p>바퀴 회전으로 적분한 Odom은 달릴수록 오차가 쌓인다. SLAM은 라이다 스캔으로 <b>위치 추정과 지도 작성을 함께</b> 하며, 그 결과를 점유 격자 지도(Occupancy Grid)로 남긴다.</p>
+<div class="grid">
+<div><b>스캔 매칭</b><br>새 스캔을 지금까지의 지도에 맞춰 로봇 위치를 바로잡는다.</div>
+<div><b>포즈 그래프</b><br>스캔을 찍은 위치를 노드로 쌓아 둔 그래프다.</div>
+<div><b>루프 클로징</b><br>왔던 곳을 다시 알아보면 쌓인 오차를 한꺼번에 바로잡는다 (<code>do_loop_closing</code>).</div>
+</div>
+<p>SLAM은 <code>map → odom</code> 보정값을 발행한다. 그래서 TF는 다음처럼 이어진다.</p>
+<div class="flow"><span>map</span><b>→ (SLAM 보정)</b><span>odom</span><b>→ (브리지 odom)</b><span>base_footprint</span></div>
+
+<h3>구조: launch 분기</h3>
+<table>
+<tr><th>mode</th><th>warehouse.launch.py</th><th>navigation.launch.py</th><th>RViz Fixed Frame</th></tr>
+<tr><td><code>drive</code></td><td>SLAM · Nav2 launch를 아예 부르지 않음</td><td>-</td><td><code>odom</code></td></tr>
+<tr><td><code>slam</code></td><td rowspan="2"><code>mode</code> · <code>map</code> 인자를 그대로 넘겨 <code>navigation.launch.py</code> 포함</td><td><code>slam_toolbox</code>의 <code>online_async_launch.py</code> 포함</td><td><code>map</code></td></tr>
+<tr><td><code>nav</code></td><td>지도 파일이 있으면 map_server · amcl + Nav2, 없으면 SLAM</td><td><code>map</code></td></tr>
+</table>
+<p><code>online_async</code>는 달리면서 실시간으로 지도를 만들고, 계산이 밀리면 스캔을 건너뛴다. RViz는 설정 파일 하나(<code>config/navigation.rviz</code>)를 함께 쓰고 <code>-f</code>로 Fixed Frame만 바꾼다.</p>
+
+<table>
+<tr><th>slam.yaml 파라미터</th><th>값</th><th>뜻</th></tr>
+<tr><td><code>odom_frame</code> / <code>map_frame</code> / <code>base_frame</code></td><td><code>odom</code> / <code>map</code> / <code>base_footprint</code></td><td>브리지 · URDF가 내는 TF 이름과 같아야 함</td></tr>
+<tr><td><code>scan_topic</code></td><td><code>/scan</code></td><td>라이다 입력</td></tr>
+<tr><td><code>mode</code></td><td><code>mapping</code></td><td>지도를 새로 만듦 (만든 지도에서 위치만 찾는 localization도 있음)</td></tr>
+<tr><td><code>solver_plugin</code></td><td><code>solver_plugins::CeresSolver</code></td><td></td></tr>
+<tr><td><code>resolution</code></td><td><code>0.05</code></td><td>지도 한 칸 = 5 cm</td></tr>
+<tr><td><code>max_laser_range</code></td><td><code>20.0</code></td><td></td></tr>
+<tr><td><code>minimum_travel_distance</code> · <code>minimum_travel_heading</code></td><td><code>0.05</code> · <code>0.05</code></td><td>이만큼 움직여야 새 스캔을 그래프에 추가</td></tr>
+<tr><td><code>minimum_time_interval</code> · <code>transform_publish_period</code> · <code>map_update_interval</code></td><td><code>0.1</code> · <code>0.02</code> · <code>1.0</code></td><td></td></tr>
+<tr><td><code>use_scan_matching</code> · <code>do_loop_closing</code></td><td><code>true</code> · <code>true</code></td><td></td></tr>
+</table>
+<p>launch에서 slam_toolbox에 넘기는 인자는 <code>use_sim_time: true</code>(<code>/clock</code> 기준), <code>autostart: true</code>(lifecycle을 바로 active로), <code>slam_params_file</code>(나머지 설정은 모두 <code>slam.yaml</code>) 셋이다.</p>
+
+<h3>실습 명령</h3>
+<pre><code># 터미널 1: slam 모드 (부스의 사람들은 서 있으므로 그대로 지도에 그려진다)
+source /opt/ros/jazzy/setup.bash
+source scripts/env.sh
+./scripts/robotworld slam
+
+# 터미널 2: 노드 · 토픽 확인
+ros2 node list
+ros2 topic list | grep -E 'map|slam|pose'
+
+# 터미널 3: 직접 운전하거나, 자동 순회 (17 지점 · 약 18 m, 출발점으로 복귀)
+./scripts/robotworld teleop
+python docs/camp/slam_tour.py
+
+# 터미널 2: 보정값 · 지도 정보 · 주기
+ros2 run tf2_ros tf2_echo map odom
+ros2 topic echo --once /map --field info
+ros2 topic hz /map
+
+# 터미널 2: 지도 저장
+mkdir -p artifacts/maps
+ros2 run nav2_map_server map_saver_cli -f artifacts/maps/my_booth
+cat artifacts/maps/my_booth.yaml</code></pre>
+
+<h3>확인 포인트</h3>
+<ul>
+<li>한 바퀴 돈 뒤 <code>tf2_echo map odom</code>에서 보정값이 나오는지, <code>/map</code>이 주기적으로 갱신되는지 본다.</li>
+<li><code>map_saver_cli</code>는 이미지(pgm)와 yaml 한 쌍을 만든다.</li>
+<li>지도에서 서 있는 사람(손님 · 직원)은 다리 두 개가 점 두 개로 남는다. 라이다 높이에서 보이는 것만 지도에 그려진다.</li>
+</ul>
+<div class="callout warn"><b>내 지도 vs 패키지 지도.</b> SLAM 지도의 원점은 로봇이 출발한 자리(home)이고, 패키지 지도의 원점은 부스 모서리(world)다. <code>locations.yaml</code>의 좌표는 world 기준이므로 장소 이름으로 다니려면 패키지 지도(<code>maps/booth</code>)를 쓴다. 패키지 지도는 테이블을 윗면 크기로 막아 두어 팔 · 몸통이 걸리지 않게 했다.</div>
+<p>해 볼 것으로는 <code>resolution</code>을 <code>0.1</code>로 바꿔 pgm 크기와 테이블 다리 모양을 비교하거나, 저장한 지도로 <code>./scripts/robotworld start map:=$PWD/artifacts/maps/my_booth.yaml</code>을 실행해 본다.</p>
+</section>
+
+<!-- ───────────── 09 Nav2 ───────────── -->
+<section class="glass card" id="s2">
+<h2>2. Nav2로 목표까지 주행</h2>
+
+<h3>핵심 개념</h3>
+<p>Nav2는 지도 위에서 목표 자세(x, y, yaw)까지 가는 서버 묶음이다. 각 서버는 <b>lifecycle 노드</b>여서 lifecycle manager가 configure → activate 순서로 켠다.</p>
+<table>
+<tr><th>구성 요소</th><th>역할</th><th>이 프로젝트 설정</th></tr>
+<tr><td>map_server</td><td>저장된 지도를 <code>/map</code>으로 발행</td><td><code>yaml_filename</code> = 지도 파일</td></tr>
+<tr><td>AMCL</td><td>그 지도 위에서 파티클로 위치 추정</td><td>파티클 <code>500</code>~<code>2000</code>, <code>likelihood_field</code></td></tr>
+<tr><td>Costmap</td><td>부딪히면 안 되는 곳 (global · local)</td><td>local = odom 기준 5 m × 5 m <code>rolling_window</code></td></tr>
+<tr><td>Planner</td><td>전역 경로</td><td>NavFn을 A*로 (<code>use_astar: true</code>)</td></tr>
+<tr><td>Controller</td><td>경로를 따라가는 속도 명령</td><td>RotationShim + DWB, <code>controller_frequency: 15.0</code></td></tr>
+<tr><td>Behavior Tree</td><td>계획 · 추종 · 복구 동작의 순서</td><td><code>bt_navigator</code></td></tr>
+</table>
+<div class="flow"><span>목표 (/navigate_to_pose)</span><b>→</b><span>bt_navigator</span><b>→</b><span>planner_server</span><b>→</b><span>smoother_server</span><b>→</b><span>controller_server</span></div>
+
+<h3>구조: nav 모드 launch</h3>
+<ul>
+<li>지도 파일이 있으면 <code>map_server</code> · <code>amcl</code>을 띄운다. 없으면 이 둘 대신 SLAM이 <code>/map</code>과 <code>map → odom</code>을 낸다.</li>
+<li>spawn 값을 AMCL <code>initial_pose</code>로 넘겨 시작부터 지도와 맞춘다. 넘기지 않으면 <code>nav2.yaml</code>의 (0, 0, 0)이다.</li>
+<li>Nav2 서버 5개(<code>controller_server</code>, <code>planner_server</code>, <code>smoother_server</code>, <code>behavior_server</code>, <code>bt_navigator</code>)와 <code>mobile_lifecycle_manager</code>(<code>autostart: True</code>, <code>bond_timeout: 10.0</code>). 한 노드라도 죽으면 전체를 내린다.</li>
+</ul>
+<table>
+<tr><th>nav2.yaml 파라미터</th><th>값</th><th>뜻</th></tr>
+<tr><td><code>max_vel_x</code> · <code>max_vel_theta</code> · <code>acc_lim_x</code></td><td><code>0.3</code> · <code>0.65</code> · <code>0.4</code></td><td>최고 0.3 m/s</td></tr>
+<tr><td><code>sim_time</code></td><td><code>1.7</code></td><td>후보 속도마다 1.7 초 앞까지 궤적을 그려 봄</td></tr>
+<tr><td><code>xy_goal_tolerance</code></td><td><code>0.08</code></td><td>목표 8 cm 안이면 도착</td></tr>
+<tr><td><code>critics</code></td><td><code>[RotateToGoal, Oscillation, ObstacleFootprint, GoalAlign, PathAlign, PathDist, GoalDist]</code></td><td>궤적 점수 항목</td></tr>
+<tr><td><code>rotate_to_heading_angular_vel</code></td><td><code>0.6</code></td><td>경로 방향과 많이 어긋나면 먼저 제자리 회전 (RotationShim)</td></tr>
+<tr><td><code>inflation_radius</code> · <code>cost_scaling_factor</code></td><td><code>0.55</code> · <code>3.0</code></td><td>장애물 둘레 55 cm까지 비용</td></tr>
+<tr><td><code>footprint</code></td><td><code>[[0.38,0.32],[0.38,-0.32],[-0.38,-0.32],[-0.38,0.32]]</code></td><td>위에서 본 0.76 m × 0.64 m 사각형</td></tr>
+<tr><td>planner <code>tolerance</code> · <code>allow_unknown</code></td><td><code>0.15</code> · <code>true</code></td><td>목표 칸이 막히면 15 cm 안의 다른 칸, 지도에 없는 칸도 통과 가능</td></tr>
+</table>
+
+<h3>실습 명령</h3>
+<pre><code># 터미널 1: 주행만 (MoveIt 없이). 지도 = maps/booth.yaml
+./scripts/robotworld nav moveit:=false
+
+# 터미널 2: 노드 · 액션 · lifecycle 상태
+ros2 node list
+ros2 action list
+for n in map_server amcl controller_server planner_server smoother_server behavior_server bt_navigator; do \
+ echo "/$n: $(ros2 lifecycle get /$n)"; done
+
+# 터미널 3: 인포 데스크 앞 (x, y, yaw) = locations.yaml 의 info
+time ./scripts/robotworld goal 7.43 -3.77 -1.15
+
+# AMCL 실험: 틀린 초기 위치를 준 뒤 주행하며 바로잡히는지 보기
+ros2 topic pub -1 /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
+  "{header: {frame_id: map}, pose: {pose: {position: {x: 5.9, y: -2.8}, orientation: {z: 0.1987, w: 0.9801}},
+    covariance: [0.25,0,0,0,0,0, 0,0.25,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0.0685]}}"
+./scripts/robotworld goal 4.88 -3.02 2.77</code></pre>
+<p>목표를 보내는 방법은 셋이다. <code>goal</code> 명령(액션), RViz의 <b>2D Goal Pose</b>(<code>/goal_pose</code> → bt_navigator), 직접 작성한 액션 클라이언트. 초기 위치는 RViz <b>2D Pose Estimate</b>(<code>/initialpose</code> → amcl)나 <code>ros2 topic pub</code>으로 준다.</p>
+
+<h3>goal.py 핵심 (액션 클라이언트)</h3>
+<pre><code>client = ActionClient(node, NavigateToPose, "/navigate_to_pose")
+if not client.wait_for_server(timeout_sec=30.0): ...
+goal.pose.header.frame_id = "map"                       # 목표는 map 좌표
+goal.pose.pose.orientation.z = math.sin(options.yaw / 2)  # yaw → 쿼터니언
+goal.pose.pose.orientation.w = math.cos(options.yaw / 2)
+future = client.send_goal_async(goal)                   # 1단계: 받아들였는지
+result = handle.get_result_async()                      # 2단계: 끝났는지
+status = result.result().status                         # 4 = SUCCEEDED</code></pre>
+
+<h3>확인 포인트</h3>
+<ul>
+<li>lifecycle 7개가 모두 <code>active</code>인지 먼저 본다. <code>wait_for_server</code>는 active가 될 때까지 최대 30 초 기다린다.</li>
+<li>결과 <code>status</code>는 4 = SUCCEEDED, 6 = ABORTED(가지 못함)이다.</li>
+<li>목표 <code>frame_id</code>는 <code>map</code>이다. odom 좌표가 아니다.</li>
+<li>노드에 <code>use_sim_time</code>을 켜야 목표 시각이 시뮬레이션 시각으로 찍힌다.</li>
+</ul>
+<div class="callout warn">SLAM으로 만든 <code>my_booth.yaml</code>로 주행하면 지도 원점이 출발 자리라서 같은 좌표가 다른 곳을 가리킨다.</div>
+</section>
+
+<!-- ───────────── 10 충돌 회피 ───────────── -->
+<section class="glass card" id="s3">
+<h2>3. Nav2 충돌 회피: 지도에 없는 관람객</h2>
+
+<h3>핵심 개념</h3>
+<p>지도에 없는 관람객은 정적 지도에는 없고 <b>라이다 · 카메라에만 보인다</b>. Nav2는 local costmap의 obstacle_layer에 라이다로 장애물을 칠하고, controller가 그 장애물을 피하는 궤적을 고른다. 이 장의 관람객은 서 있기만 한다.</p>
+<div class="flow"><span>/scan</span><b>→</b><span>obstacle_layer (marking · clearing)</span><b>→</b><span>inflation_layer (0.55 m)</span><b>→</b><span>DWB 후보 궤적 평가</span><b>→</b><span>/local_plan</span></div>
+<div class="grid">
+<div><b>marking</b><br>광선이 멈춘 칸을 막힘으로 칠한다.</div>
+<div><b>clearing</b><br>광선이 지나간 칸을 비운다. 이것이 있어야 사람이 비킨 자리가 다시 빈 칸이 된다.</div>
+</div>
+
+<h3>구조: 회피에 관여하는 설정</h3>
+<table>
+<tr><th>위치</th><th>설정</th><th>뜻</th></tr>
+<tr><td>local_costmap</td><td><code>update_frequency: 10.0</code> · <code>publish_frequency: 5.0</code></td><td>사람이 0.1 초 안에 반영됨</td></tr>
+<tr><td>local_costmap</td><td><code>global_frame: odom</code> · <code>rolling_window: true</code> · <code>width/height: 5</code> · <code>resolution: 0.05</code></td><td>지도가 아니라 지금 보이는 것만 담음</td></tr>
+<tr><td>obstacle_layer</td><td><code>observation_sources: scan</code>, <code>raytrace_max_range: 20.0</code>, <code>obstacle_max_range: 19.5</code></td><td><code>/scan</code> (<code>LaserScan</code>)으로 marking · clearing</td></tr>
+<tr><td>inflation_layer</td><td><code>inflation_radius: 0.55</code> · <code>cost_scaling_factor: 3.0</code></td><td>멀어질수록 비용이 낮아짐 (factor가 클수록 빨리)</td></tr>
+<tr><td>footprint</td><td>0.76 m × 0.64 m</td><td>사각형이 막힌 칸에 닿는 궤적은 버림</td></tr>
+<tr><td>bt_navigator</td><td><code>navigate_w_recovery_and_replanning_only_if_path_becomes_invalid.xml</code></td><td>기본 BT는 1 초마다 재계획, 이 BT는 경로가 막혔을 때만</td></tr>
+</table>
+<p>RViz에는 Global Costmap(<code>/global_costmap/costmap</code>, Alpha 0.3), Local Costmap(<code>/local_costmap/costmap</code>, Alpha 0.7), Footprint(<code>/local_costmap/published_footprint</code>), DWB Trajectories(<code>/marker</code>), Local Plan(<code>/local_plan</code>)을 추가했다. costmap은 지도와 같은 <code>OccupancyGrid</code>라 Map 표시로 본다.</p>
+
+<h3>실습 명령</h3>
+<pre><code># 터미널 1: 관람객 배우 파일을 넣어 nav 실행 (기본 실행에는 들어가지 않음)
+./scripts/robotworld nav moveit:=false actors:=$PWD/src/mobile_openarm_mujoco/worlds/actors_avoid.yaml
+
+# 터미널 2: standing — 관람객을 (6.30, -3.50) 에 세우고, 로봇은 인포 앞 (7.43, -3.77) 으로
+python docs/camp/avoid_scenario.py
+
+# blocked — 관람객을 통로 가운데 (5.35, -4.50) 에, 목표는 입구
+python docs/camp/avoid_scenario.py --mode blocked --timeout 90
+# clear — 관람객을 부스 밖으로 보내고 같은 목표 다시
+python docs/camp/avoid_scenario.py --mode clear</code></pre>
+<p><code>avoid_scenario.py</code>는 <code>/warehouse/set_actor</code> 서비스의 teleport로 관람객을 옮겨 세우고, 2 초 기다려 라이다가 본 뒤 <code>/navigate_to_pose</code> 목표를 보낸다. <code>--timeout</code> 초 동안 결과가 없으면 목표를 취소한다.</p>
+
+<h3>확인 포인트 (실측)</h3>
+<table>
+<tr><th>시나리오</th><th>결과</th></tr>
+<tr><td>standing (길 옆)</td><td>14.1 초에 도착 (관람객이 없을 때 약 15 초). 최소 중심 거리 0.54 m (3.5 초), 직선 경로에서 최대 0.55 m 벗어남. 닿는 거리(약 0.57 m)보다 조금 가까워 바짝 지나갔지만 부딪히지는 않음</td></tr>
+<tr><td>blocked (하나뿐인 통로)</td><td>관람객 0.87 m 앞에서 멈춤. 제자리에서 몇 번 돌며 다시 시도하지만 길이 없음. 68 초 뒤 관람객이 비키자 costmap에서 지워지고 통과</td></tr>
+</table>
+<div class="callout warn"><b>한계.</b> 길을 완전히 막으면 Nav2는 돌아갈 길을 만들 수 없다. 관람객이 비켜 clearing으로 칸이 비워질 때까지 기다리거나 목표를 취소해야 한다.</div>
+<p>해 볼 것으로는 standing 자리를 (6.30, -3.20)으로 옮겨 직선 경로 한가운데에 세우기, <code>inflation_radius</code>를 0.8로 키워 최소 거리 비교하기, blocked에서 <code>--timeout</code>을 늘려 Nav2가 스스로 ABORTED를 낼 때까지 기다리기가 있다.</p>
+</section>
+
+<!-- ───────────── 11 순찰 데모 ───────────── -->
+<section class="glass card" id="s4">
+<h2>4. 전반부 통합 Demo: 부스 순찰과 웹 대시보드</h2>
+
+<h3>핵심 개념</h3>
+<p>지금까지 만든 지도 · 위치 추정 · Nav2 주행을 순찰 노드 <code>patrol.py</code> 하나로 묶는다. 정지점마다 <code>NavigateToPose</code>를 보내고, 걸린 시간과 AMCL · odom 오차를 재서 <code>/patrol/status</code>로 알린다. 웹 대시보드는 그 상태와 카메라 영상을 브라우저에 보여 준다.</p>
+<div class="flow"><span>entrance</span><b>→</b><span>classroom_1</span><b>→</b><span>pharmacy</span><b>→</b><span>info</span><b>→</b><span>home</span></div>
+<p>정지 하나의 흐름은 다음과 같다.</p>
+<div class="flow"><span>locations.yaml base_goal (x, y, yaw)</span><b>→</b><span>map 프레임 목표 전송</span><b>→</b><span>accepted 확인</span><b>→</b><span>결과 대기 + 워치독</span><b>→</b><span>1 s 대기 후 오차 기록</span></div>
+
+<h3>구조: patrol.py</h3>
+<table>
+<tr><th>부분</th><th>하는 일</th></tr>
+<tr><td><code>Patrol.go</code></td><td><code>send_goal_async(goal, feedback_callback=on_feedback)</code>. 피드백(남은 거리 · 복구 횟수 · 예상 시간)을 상태에 싣고, <code>spin_once(timeout_sec=0.05)</code>로 기다리는 동안에도 콜백을 돌린다</td></tr>
+<tr><td>취소</td><td>대시보드 [취소] → CANCELED. 워치독 <code>cancel_near</code> → NEAR로 도착 처리</td></tr>
+<tr><td>워치독</td><td><code>NEAR_DIST, NEAR_STALL_S = 0.25, 8.0</code>. <code>/ground_truth</code>가 1 cm · 0.02 rad 넘게 변하면 정지 시계 재시작. AMCL 기준 목표 0.25 m 안 + 8 s 정지면 다음 정지점으로</td></tr>
+<tr><td><code>Patrol.run</code></td><td>정지점마다 시간 [s] · <code>err_amcl</code> · <code>err_odom</code> [m] 기록 (오차 = <code>/ground_truth</code>와의 평면 거리). 실패하면 <code>break</code>. 상태는 <code>done</code> / <code>near</code> / <code>failed</code></td></tr>
+<tr><td><code>Patrol.publish</code></td><td>상태 전체를 JSON 문자열로 <code>/patrol/status</code>에 0.5 s마다 발행 (<code>TRANSIENT_LOCAL</code>). <code>/patrol/command</code>로 <code>start</code> · <code>cancel</code>을 받음</td></tr>
+</table>
+<p>워치독이 필요한 이유는 DWB가 목표 몇 cm 앞에서 바퀴 마찰을 못 이기고 서 버리는 경우가 있어서다. RotationShim(<code>angular_dist_threshold: 0.6</code>, <code>rotate_to_heading_angular_vel: 0.6</code>, <code>rotate_to_goal_heading: true</code>)은 DWB의 작은 회전 명령이 바퀴 마찰에 묻히는 문제를 고정 각속도 회전으로 해결한다. critic 비중은 <code>PathAlign.scale: 16.0</code>, <code>PathDist.scale: 16.0</code>, <code>GoalDist.scale: 12.0</code>, <code>ObstacleFootprint.scale: 0.05</code>로 경로 추종이 장애물보다 훨씬 크다.</p>
+
+<h3>실습 명령: 순찰</h3>
+<pre><code># 터미널 1: 패키지 지도 maps/booth (장소 좌표가 world 기준이라 SLAM으로 만든 지도는 쓰지 않는다)
+./scripts/robotworld nav moveit:=false
+
+# 터미널 2: 기본 경로 entrance → classroom_1 → pharmacy → info → home
+python lessons/04_navigation/patrol.py
+
+# 터미널 3: 순찰 중 상태 보기
+ros2 topic echo --once /patrol/status</code></pre>
+
+<h3>막혔던 곳: Failed to make progress</h3>
+<table>
+<tr><th>증상</th><td>처음 순서(인포 → 입구 → 교실1 → 약국 → home)에서 둘째 구간 실패. controller가 "Failed to make progress"를 되풀이하고, 제자리 회전 · 대기(복구 동작) 뒤에도 같은 자리</td></tr>
+<tr><th>원인</th><td>인포에서 입구로 가는 길은 상담 테이블 2를 서쪽으로 돌아 내려가는 길 하나뿐. 모서리 (5.95, −3.54)에서 멈춘 로봇의 footprint가 막힘 영역에 걸쳐 고를 수 있는 속도가 없음. 사람이 아니라 경로와 로봇 크기의 문제</td></tr>
+<tr><th>해결</th><td>순서를 입구 → 교실1 → 약국 → 인포 → home으로 바꿈. home에서 내려가는 길은 통로 가운데를 지나 15.1 s에 도착</td></tr>
+</table>
+<div class="callout ok">좁은 곳을 지나는 목표는 넓은 쪽에서 들어가도록 순서 · 경유지를 정한다.</div>
+
+<h3>웹 대시보드: 프로세스 셋</h3>
+<div class="flow"><span>robotworld nav + frame_tap (JPEG → /dev/shm)</span><b>→</b><span>server.py (ROS 노드 + Flask)</span><b>→</b><span>브라우저 (SSE · MJPEG · POST)</span></div>
+<table>
+<tr><th>경로</th><th>방식</th><th>요점</th></tr>
+<tr><td><code>/api/stream</code></td><td>SSE (<code>text/event-stream</code>)</td><td>0.2 s마다 상태 스냅숏 전체를 JSON으로 (5 Hz)</td></tr>
+<tr><td><code>/camera/&lt;name&gt;.mjpg</code></td><td>MJPEG (<code>multipart/x-mixed-replace; boundary=frame</code>)</td><td><code>st_mtime_ns</code>가 바뀔 때만 전송. <code>Path(name).name</code>으로 <code>../</code> 요청 차단</td></tr>
+<tr><td><code>/api/command</code></td><td>HTTP POST</td><td><code>start</code> · <code>cancel</code>만 <code>/patrol/command</code>로 발행, 그 외는 400</td></tr>
+<tr><td><code>/api/cameras</code></td><td>HTTP GET</td><td>카메라 목록</td></tr>
+</table>
+<ul>
+<li><b>frame_tap</b>: MuJoCo 카메라는 이미지 토픽이 없어 최신 프레임을 JPEG로 저장한다. 기존 인식(<code>/vision/*</code>)을 먼저 하고, 임시 파일에 쓴 뒤 <code>os.replace</code>로 원자적으로 교체한다.</li>
+<li><b>스레드 둘</b>: <code>executor.spin</code>은 daemon 스레드(ROS), Flask는 <code>threaded=True</code> · <code>use_reloader=False</code>로 메인 스레드. 공유 dict는 <code>lock</code>으로 보호하고 <code>snapshot</code>은 복사본을 돌려준다. <code>SignalHandlerOptions.NO</code>로 Ctrl+C는 Flask가 받는다.</li>
+<li><b>odom 좌표 변환</b>: odom은 켜진 자리(home)가 0이라, 첫 <code>/ground_truth</code>로 그 자리를 구해 world 좌표로 옮긴 뒤 지도에 그린다.</li>
+<li><b>브라우저</b>: ROS를 모른다. <code>EventSource</code> 하나로 화면 전체를 다시 그리고, 지도 PNG는 <code>map_version</code>이 바뀔 때만 다시 받는다.</li>
+</ul>
+
+<h3>실습 명령: 대시보드</h3>
+<pre><code># 터미널 1: 카메라 프레임 저장
+./scripts/robotworld nav moveit:=false \
+  camera_fps:=5 camera_handler:=lessons/04_navigation/dashboard/frame_tap.py:DashboardPipeline
+
+# 터미널 2: 대시보드 서버 (다른 PC 에서 보려면 --host 0.0.0.0)
+python lessons/04_navigation/dashboard/server.py
+
+# 터미널 3: 순찰 (시작 버튼 대기)
+python lessons/04_navigation/patrol.py --wait
+
+# 브라우저
+google-chrome http://localhost:8080
+
+# 터미널 4: 브라우저 없이 API 보기
+curl -s localhost:8080/api/cameras
+curl -s -X POST -H "Content-Type: application/json" -d '{"cmd":"start"}' localhost:8080/api/command
+curl -s -N localhost:8080/api/stream | head -c 600</code></pre>
+
+<h3>확인 포인트</h3>
+<ul>
+<li><code>/patrol/status</code>는 발행 쪽과 같은 LATCHED(<code>TRANSIENT_LOCAL</code>) QoS로 구독해야 나중에 켠 대시보드도 마지막 값을 받는다.</li>
+<li>critic <code>scale</code>은 <code>critics</code>에 적은 이름으로 써야 적용된다. <code>BaseObstacle.scale</code>은 무시된다.</li>
+<li>해 볼 것으로 <code>patrol.py --route info,table_b,pole --loops 2</code>로 경로를 바꾸거나, <code>rotate_to_heading_angular_vel</code>을 0.3으로 낮춰 구간 시간을 비교하거나, <code>server.py --host 0.0.0.0</code>으로 같은 네트워크의 노트북 · 휴대폰에서 <code>http://&lt;이 PC IP&gt;:8080</code>을 열어 본다.</li>
+</ul>
+</section>
+
+<!-- ───────────── 정리 ───────────── -->
+<section class="glass card" id="s5">
+<h2>5. 정리</h2>
+<ul>
+<li>SLAM Toolbox는 <code>/scan</code>과 odom으로 지도를 만들고 <code>map → odom</code> 보정을 발행한다. 프레임 이름은 브리지 · URDF와 같아야 한다.</li>
+<li>모드는 <code>drive</code>(SLAM · Nav2 없음, Fixed Frame <code>odom</code>), <code>slam</code>, <code>nav</code>(지도 있으면 map_server · amcl, 없으면 SLAM)로 갈리며 분기점은 <code>navigation.launch.py</code> 한 곳이다.</li>
+<li>SLAM 지도 원점은 출발 자리(home), 패키지 지도 원점은 world다. 장소 이름(<code>locations.yaml</code>)으로 다니려면 패키지 지도를 쓴다.</li>
+<li>목표는 액션 <code>/navigate_to_pose</code>로 보내며 <code>frame_id: map</code>, 결과 status 4 = SUCCEEDED, 6 = ABORTED이다.</li>
+<li>회피는 local costmap의 marking · clearing과 inflation(0.55 m), footprint로 결정된다. 하나뿐인 통로가 막히면 비킬 때까지 지나갈 수 없다.</li>
+<li>"Failed to make progress"는 사람이 아니라 footprint와 경로 모서리 문제일 수 있다. 순서 · 경유지를 바꿔 넓은 쪽으로 들어가게 한다.</li>
+<li>대시보드는 ROS 노드 + Flask 두 스레드이고, 브라우저는 SSE · MJPEG · POST만 쓴다.</li>
+</ul>
+<h3>스스로 점검</h3>
+<ol>
+<li>SLAM으로 만든 <code>my_booth.yaml</code>로 <code>goal 7.43 -3.77 -1.15</code>를 보내면 인포 데스크 앞에 도착하지 않는 이유는 무엇인가?</li>
+<li>local costmap에서 <code>clearing</code>을 끄면 관람객이 비킨 뒤 로봇은 어떻게 행동하겠는가?</li>
+<li>patrol.py의 워치독은 어떤 조건에서 목표를 <code>cancel_near</code>로 취소하며, 왜 필요한가?</li>
+</ol>
+</section>
+
+</main>
+<footer class="glass pager"><a href="02_model_bridge_sensors.html">← 이전 장</a><a href="index.html">목차</a><a href="04_manipulation.html">다음 장 →</a></footer>
+</div></body></html>

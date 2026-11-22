@@ -1,0 +1,366 @@
+<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5장. LLM 지령 · Task Pipeline · Web FMS · Final Mission · 확장(PID/LQR, Isaac Sim) | Sim-ROS2</title><link rel="stylesheet" href="assets/style.css"></head>
+<body><!-- 5장 압축 교육자료: 원본 16~21강(LLM 지령, Task Pipeline, Web FMS, Final Mission, PID/LQR, Isaac Sim)을 한 페이지로 정리 -->
+<div class="wrap">
+<header class="glass hero"><div class="kicker">Sim-ROS2 · 5장 압축 교육자료 · 5/5</div><h1>5장. LLM 지령 · Task Pipeline · Web FMS · Final Mission · 확장(PID/LQR, Isaac Sim)</h1><p>자연어 한 문장을 검증된 명령과 단계 계획으로 바꾸고, Task Manager와 웹 FMS로 부스 서빙을 끝까지 실행합니다. 마지막으로 카트-폴 PID/LQR 제어와 Isaac Sim 이식으로 확장합니다. 원본 16~21강.</p></header>
+<nav class="glass toc" aria-label="목차"><ol>
+<li><a href="#s1">LLM + OpenAI API: 자연어 → RobotCommand (16강)</a></li>
+<li><a href="#s2">LLM → ROS 2 Task Pipeline: RobotPlan (17강)</a></li>
+<li><a href="#s3">Web FMS: 브라우저 한 화면 (18강)</a></li>
+<li><a href="#s4">Final Mission: 컵 위치표와 End-to-End (19강)</a></li>
+<li><a href="#s5">제어 기법 PID · LQR: 카트-폴 (20강)</a></li>
+<li><a href="#s6">Isaac Sim 확장: 같은 부스, 다른 물리 (21강)</a></li>
+<li><a href="#s7">정리</a></li>
+</ol></nav>
+<main>
+
+<section class="glass card" id="s1">
+<h2>1. LLM + OpenAI API: 자연어 → Structured Command (16강)</h2>
+<h3>핵심 개념</h3>
+<p>LLM은 로봇을 직접 움직이지 않습니다. 한국어 문장을 <code>RobotCommand</code>라는 정해진 형식(의도 하나 + 슬롯)으로 바꾸는 일만 맡고, 그 결과가 실행 가능한지는 코드가 한 번 더 검사합니다.</p>
+<div class="flow"><span>한국어 문장</span><b>→</b><span>LLM (Structured Output)</span><b>→</b><span>스키마 검증 (pydantic)</span><b>→</b><span>세계 검증 (validate_world)</span><b>→</b><span>실행 / 되묻기 / 거부</span></div>
+<div class="grid">
+<div><strong>스키마 검증</strong><br>JSON 스키마는 형식만 보장합니다. <code>Intent</code>·<code>Place</code>가 Enum이라 목록 밖 값은 나올 수 없습니다.</div>
+<div><strong>세계 검증</strong><br>의미(옮길 수 있는 컵인가, 목적지가 있는가)는 <code>validate_world</code>가 검사하고 문제를 한국어 문장 목록으로 돌려줍니다. 빈 목록이면 실행 가능합니다.</div>
+</div>
+<h3>구조: 의도 8개와 슬롯</h3>
+<table>
+<tr><th>필드</th><th>내용</th></tr>
+<tr><td><code>intent</code></td><td><code>move_object</code> · <code>go_to</code> · <code>find</code> · <code>report</code> · <code>answer</code> · <code>arm_pose</code> · <code>gripper</code> · <code>stop</code> (8개). <code>answer</code>는 움직이지 않고 말로 답 · 되묻기 · 거부</td></tr>
+<tr><td><code>target</code></td><td>물체(<code>cup_pink</code> 등) · person · 자세(ready, hands_up, transport, home) · 그리퍼(open, close)</td></tr>
+<tr><td><code>source</code> / <code>destination</code></td><td><code>Place</code> Enum ('' · home · drinks · consult_1 · consult_2 · info ...). 출발지가 비면 <code>drinks</code>로 채움</td></tr>
+<tr><td><code>reply</code></td><td>사용자에게 할 한 문장 (되묻기 · 거부 포함)</td></tr>
+</table>
+<p>필드의 <code>description</code>도 스키마에 실려 모델에게 전달되므로 필드 설명이 곧 프롬프트입니다. 컵은 마커가 있는 세 스테이션(<code>STATIONS</code>: drinks · consult_1 · consult_2) 사이에서만 옮길 수 있습니다.</p>
+<p>프롬프트는 세 부분입니다. <code>SYSTEM</code>(장소의 한국어 별칭 · 기본값 · 판단 규칙, 색 · 목적지가 없으면 추측 금지 → <code>answer</code>로 되묻기, 위험한 요청은 <code>answer</code>로 거부), few-shot <code>EXAMPLES</code> 4개(실행 명령 · 팔 자세 · 찾기 · 되묻기), 그리고 이번 문장입니다. 파싱은 <code>temperature=0.0</code>으로 부릅니다.</p>
+<pre><code># src/warehouse_lecture/warehouse_lecture/llm/client.py  LLM.parse 핵심
+response = self.client.chat.completions.parse(
+    model=model,                      # llm.yaml: gpt-4.1-mini
+    messages=messages,
+    response_format=schema,           # pydantic → JSON 스키마 → 응답이 따르게 강제
+    ...)
+message = response.choices[0].message
+if message.refusal:
+    raise ValueError(f"Model refused: {message.refusal}")
+return message.parsed                 # 검증이 끝난 RobotCommand 객체</code></pre>
+<h3>설정: llm.yaml</h3>
+<table>
+<tr><th>항목</th><th>값</th></tr>
+<tr><td>models</td><td>chat <code>gpt-4.1-mini</code> · reasoning <code>gpt-4.1</code> · vision <code>gpt-4.1-mini</code></td></tr>
+<tr><td>defaults</td><td>temperature 0.2 · max_output_tokens 800 · timeout_s 30 · max_retries 2</td></tr>
+<tr><td>pricing (USD / 1M 토큰, 추정용)</td><td>gpt-4.1-mini input 0.40 / output 1.60 · gpt-4.1 input 2.00 / output 8.00</td></tr>
+<tr><td>usage_log</td><td><code>logs/openai_usage.jsonl</code> (호출마다 JSON 한 줄, <code>purpose</code>로 출처 구분)</td></tr>
+</table>
+<h3>실습 명령</h3>
+<pre><code>cp .env.example .env     # OPENAI_API_KEY=sk-... 기입 (.env 는 .gitignore 에 있다)
+source /opt/ros/jazzy/setup.bash
+source scripts/env.sh    # 시뮬레이터는 필요 없다
+./scripts/robotworld exec python lessons/08_lmm/01_hello.py
+./scripts/robotworld exec python lessons/08_lmm/02_structured_command.py
+./scripts/robotworld exec python lessons/08_lmm/03_accuracy.py     # 60 문장, 약 1 분
+./scripts/robotworld exec python lessons/08_lmm/04_cost_log.py</code></pre>
+<h3>확인 포인트</h3>
+<ul>
+<li><code>03_accuracy.py</code>의 <code>score</code>는 intent가 같고, 테스트에 적힌 슬롯만 비교합니다. 되묻기(<code>ambiguous</code>) · 거부(<code>refuse</code>) 문장은 <code>intent=answer</code>에 더해 <code>reply</code>가 있어야 정답입니다.</li>
+<li>비용 = 토큰 수 / 100만 × 단가이며 출력 단가가 입력의 4배입니다. <code>pricing</code>에 없는 모델은 단가 0으로 계산되고, 로그 비용은 추정치라 실제 청구액과 다를 수 있습니다.</li>
+<li>프롬프트와 예시가 매번 함께 가므로 명령마다 입력 토큰이 일정하게 듭니다.</li>
+</ul>
+<div class="callout"><strong>해 볼 것</strong> · <code>SYSTEM</code>에 "'주행 자세' 는 transport"를 넣고 03을 다시 돌려 arm_pose 정확도 비교 · <code>03_accuracy.py --model gpt-4.1</code>로 정확도 · 지연 비교 · 내 문장 5개를 더해 <code>--test my_tests.yaml</code>로 실행</div>
+</section>
+
+<section class="glass card" id="s2">
+<h2>2. LLM → ROS 2 Task Pipeline: 문장 하나를 단계 목록으로 (17강)</h2>
+<h3>핵심 개념</h3>
+<p>"손님께 음료 가져다 드려"처럼 여러 동작이 필요한 문장은 명령 하나로 표현할 수 없습니다. LLM이 <code>RobotPlan</code>(단계 목록)을 만들고, 코드가 계획을 머릿속으로 따라가며 검증 · 보정한 뒤, Task Manager가 <code>/execute_plan</code> 액션으로 단계를 차례로 실행합니다.</p>
+<div class="flow"><span>문장</span><b>→</b><span>PlanParser (LLM)</span><b>→</b><span>RobotPlan.validate_world</span><b>→</b><span>PlanDialogManager (되묻기 · 확인)</span><b>→</b><span>/execute_plan (Task Manager)</span><b>→</b><span>Nav2 · PickPlace</span></div>
+<h3>구조</h3>
+<table>
+<tr><th>요소</th><th>내용</th></tr>
+<tr><td><code>StepAction</code></td><td>navigate · detect · pick · place · arm_pose · gripper · report · answer (8가지). 관절 · 속도는 LLM이 건드리지 않음</td></tr>
+<tr><td><code>PlanStep</code></td><td>action · target · location · note. location은 navigate=목적지, pick=컵이 있는 곳, place=놓을 곳</td></tr>
+<tr><td><code>RobotPlan</code></td><td>summary · steps · reply. steps가 비면 실행 없이 reply만 말함 (되묻기 · 거부 · 답변)</td></tr>
+</table>
+<p>프롬프트 규칙의 핵심은 "컵을 옮기는 일은 항상 네 단계"입니다. navigate(컵이 있는 곳) → pick → navigate(도착 테이블) → place. 컵 색은 골라도 되지만 도착 테이블은 추측하지 않고 되묻습니다. 여러 잔이면 컵마다 네 단계를 반복합니다(한 번에 컵 하나).</p>
+<h3>계획 검증: here 와 held</h3>
+<table>
+<tr><th>단계</th><th>검사 · 보정</th></tr>
+<tr><td>navigate</td><td><code>here</code> = 지금 위치 갱신</td></tr>
+<tr><td>pick</td><td>location이 비면 지금 스테이션, 아니면 <code>drinks</code>로 채움 · 이미 들고 있으면 problem · <code>here</code>가 다르면 navigate 단계를 <strong>자동 추가</strong> · <code>held</code> = 든 컵</td></tr>
+<tr><td>place</td><td>놓을 곳이 없으면 problem(기본값 없음) · 든 것이 없으면 problem</td></tr>
+<tr><td>끝</td><td>든 채로 끝나면 problem (place 단계가 없다)</td></tr>
+</table>
+<h3>대화와 실행</h3>
+<ul>
+<li><code>PlanDialogManager.handle</code>: 확인 대기(<code>pending</code>) 중이면 응 → 실행, 아니 → 취소. 되묻던 중이면 앞 문장과 <code>/</code>로 이어 붙여 다시 계획합니다("손님께 음료 가져다 드려 / 2번 테이블").</li>
+<li>pick · place가 든 계획만 번호 목록과 "진행할까요?"로 확인하고, 이동 · 보고뿐인 계획은 바로 실행합니다.</li>
+<li>Task Manager는 서버에서 <code>validate_world</code>를 한 번 더 실행하고, 단계마다 피드백 발행 + 취소 확인을 합니다. 한 단계라도 실패하면 뒤 단계는 실행하지 않습니다.</li>
+<li>pick 단계는 앞 장의 <code>PickPlace</code> 액션을 <code>phase="pick"</code>으로 호출합니다(도킹 · 집기 · 들기까지).</li>
+</ul>
+<pre><code># src/warehouse_interfaces/action/ExecutePlan.action
+string summary           # 계획 요약 한 문장
+PlanStep[] steps
+string utterance         # 원문
+---
+bool success
+string message
+string spoken            # 사용자에게 보여 줄 결과 문장
+int32 steps_done         # 성공한 단계 수
+int32 failed_step        # 실패한 단계 번호 (0 부터), 없으면 -1
+---
+int32 step               # 현재 단계 (0 부터)
+int32 total
+string action
+string phase
+string detail</code></pre>
+<h3>실습 명령</h3>
+<pre><code>source /opt/ros/jazzy/setup.bash
+source scripts/env.sh
+./scripts/robotworld exec python lessons/08_lmm/05_plan.py            # 시뮬레이터 없이
+./scripts/robotworld exec python lessons/08_lmm/06_plan_accuracy.py   # 20 문장
+
+# 터미널 1
+./scripts/robotworld start     # 시뮬레이터 · Nav2 · MoveIt · PickPlace 서버 · Task Manager 를 함께 띄운다
+# 터미널 2
+./scripts/robotworld exec python lessons/08_lmm/08_text_mission.py \
+  --lines "손님께 음료 가져다 드려" "2번 테이블" "응"</code></pre>
+<h3>확인 포인트</h3>
+<ul>
+<li>결과의 <code>steps_done</code> · <code>failed_step</code> · <code>spoken</code>으로 어디서 멈췄는지 봅니다. 피드백의 <code>step</code>은 0부터이므로 출력 때 +1 합니다.</li>
+<li>실패하면 <code>spoken</code>에 "N단계까지 마쳤지만 실패했습니다"와, 컵을 아직 들고 있으면 그 사실이 붙습니다.</li>
+<li>이 강의의 예제는 컵 위치표 없이 LLM을 부르므로 <code>06</code>에서 테이블에 있는 컵을 묻는 두 문장을 틀립니다. 다음 절(19강)의 WorldState가 이를 해결합니다.</li>
+</ul>
+<div class="callout"><strong>해 볼 것</strong> · <code>07_run_plan.py pick:cup_blue@drinks place:@consult_1</code>(navigate 없이)로 Task Manager가 navigate를 끼워 넣는지 보기 · "파란 컵은 1번 테이블, 노란 컵은 2번 테이블로" → 8단계 목록을 보고 "아니"로 취소</div>
+</section>
+
+<section class="glass card" id="s3">
+<h2>3. Web FMS: 브라우저 한 화면에서 주행 · 카메라 · LLM 지령 (18강)</h2>
+<h3>핵심 개념</h3>
+<p>FMS 서버(<code>fms/server.py</code>)는 ROS 2 노드(<code>robotworld_fms</code>)이자 Flask 웹 서버입니다. ROS 콜백이 상태 사전 <code>self.s</code>에 쓰고, 브라우저는 SSE로 그 상태를 받으며 HTTP API로 명령을 보냅니다. 쓰는 스레드와 읽는 스레드가 달라 잠금(<code>lock</code>) 하나로 보호합니다.</p>
+<div class="flow"><span>ROS 토픽 (/amcl_pose, plan, /odom, /scan, 컵)</span><b>→</b><span>put() → self.s</span><b>→</b><span>/api/stream (SSE, 0.2 s)</span><b>→</b><span>브라우저 EventSource</span></div>
+<div class="flow"><span>브라우저 버튼 · 지도 · 채팅</span><b>→</b><span>HTTP API</span><b>→</b><span>/cmd_vel · Nav2 goal · /execute_plan</span></div>
+<h3>/cmd_vel 을 쓰는 세 가지와 기능별 흐름</h3>
+<table>
+<tr><th>기능</th><th>동작</th></tr>
+<tr><td>수동 조작 (dead-man)</td><td>버튼을 누르는 동안 150 ms마다 <code>/api/drive</code>. 서버는 0.1 s 타이머로 발행하고, 요청이 0.4 s 안에 다시 오지 않으면 0을 한 번 보내고 정지. 속도 제한 0.3 m/s · 0.8 rad/s. 첫 요청이 Nav2 goal · 미션을 먼저 취소</td></tr>
+<tr><td>장소 버튼 · 지도 클릭</td><td><code>NavigateToPose</code> goal(frame <code>map</code>). 장소 버튼은 <code>locations.yaml</code>의 <code>base_goal</code>, 지도 클릭은 클릭 좌표. 미션 실행 중에는 거부</td></tr>
+<tr><td>LLM 지령</td><td>앞 절의 <code>PlanDialogManager</code>를 그대로 사용. speak만 채팅 기록으로, executor만 <code>/execute_plan</code> 호출로 교체. <code>world=self.world_state</code>로 컵 위치표가 프롬프트에 들어감</td></tr>
+<tr><td>정지</td><td><code>/api/stop</code> → <code>cancel_all</code>. FMS가 보낸 Nav2 goal과 Task Manager 계획을 둘 다 취소(PickPlace · Nav2까지 취소가 내려감)</td></tr>
+<tr><td>카메라</td><td><code>/dev/shm/robotworld_fms/enabled</code> 파일이 있을 때만 JPEG 저장(원자적 교체). 서버가 MJPEG <code>/camera/head_camera.mjpg</code>로 스트리밍 → 영상이 ROS 토픽을 거치지 않음</td></tr>
+</table>
+<pre><code># fms/server.py  dead-man 핵심
+def teleop_tick(self):                                 # 0.1 s 타이머
+    v, w, t = self.teleop
+    if time.time() - t &lt; 0.4:
+        self.teleop_active = True
+        self.cmd_vel.publish(Twist(linear=Vector3(x=float(v)), angular=Vector3(z=float(w))))
+    elif self.teleop_active:                           # 손을 뗌: 0 을 한 번 보내고 조용히
+        self.teleop_active = False
+        self.cmd_vel.publish(Twist())</code></pre>
+<h3>실습 명령</h3>
+<pre><code># 터미널 1: 시뮬레이터
+cd ~/pinklab_robotworld2026
+./scripts/robotworld start     # 시뮬레이터 · Nav2 · MoveIt · PickPlace 서버 · Task Manager
+# 터미널 2: FMS 서버
+cd ~/pinklab_robotworld2026
+./scripts/robotworld fms       # 브라우저에서 http://localhost:8080
+# 다른 PC · 태블릿에서 보려면: ./scripts/robotworld fms --host 0.0.0.0</code></pre>
+<h3>확인 포인트</h3>
+<ul>
+<li>연결 표시가 "연결됨/끊김"으로 바뀌는지 확인합니다. <code>EventSource</code>는 끊기면 스스로 다시 연결합니다.</li>
+<li><code>/api/chat</code>은 새 스레드에서 처리하고 바로 응답하므로 LLM을 기다리는 동안에도 화면이 멈추지 않습니다. 앞 문장을 처리 중이면 "앞 문장을 처리 중입니다" 경고가 뜹니다.</li>
+<li>채팅의 <code>[2/4] ...</code> 줄은 Task Manager 피드백(phase가 <code>start</code>일 때)에서 나옵니다.</li>
+<li>미션 실행 중 장소 버튼을 누르면 409 오류 문장이 채팅에 떠야 정상입니다.</li>
+</ul>
+<div class="callout"><strong>해 볼 것</strong> · 지도에서 한 점을 누른 채 끌어 도착 방향 정하기 · "흰 옷 입은 손님한테 파란 컵 갖다 드려" → 손님 설명으로 테이블을 고르는지, 끝난 뒤 컵 표가 바뀌는지 보기</div>
+</section>
+
+<section class="glass card" id="s4">
+<h2>4. Final Mission: 자연어 한 문장으로 부스 서빙 End-to-End (19강)</h2>
+<h3>핵심 개념</h3>
+<p>LLM은 부스를 볼 수 없습니다. 그래서 <code>WorldState</code>(컵 위치표)를 글로 프롬프트에 넣어 주고, "이미 거기 있다" 같은 사실 판단은 LLM이 아니라 코드(<code>check</code>)가 합니다. <strong>LLM은 의도, 코드는 사실</strong>입니다.</p>
+<div class="flow"><span>WorldState.prompt()</span><b>→</b><span>PlanParser.parse (system = 규칙 + 표)</span><b>→</b><span>validate_world</span><b>→</b><span>world.check</span><b>→</b><span>확인 · 실행</span><b>→</b><span>world.apply (steps_done까지)</span></div>
+<h3>WorldState: 표 · 검사 · 갱신</h3>
+<table>
+<tr><th>함수</th><th>하는 일</th></tr>
+<tr><td><code>prompt()</code></td><td>컵마다 현재 위치, 테이블마다 앉은 손님, 위치 규칙('~로'는 도착지, '원래 자리 · 제자리' = drinks)을 글로 만듦. 호출할 때마다 새로 생성</td></tr>
+<tr><td><code>check(plan)</code></td><td>표의 복사본(<code>belief</code>)으로 계획을 따라가며 pick 장소가 표와 다르면 문제, 놓을 곳에 이미 있으면 "이미 ...에 있다". 두 오류가 겹치면 쉬운 문장 하나만 남김. unknown · held 컵은 통과</td></tr>
+<tr><td><code>apply(plan, steps_done, success)</code></td><td>계획이 아니라 실제 끝난 단계(<code>steps_done</code>)까지만 반영. 실패한 바로 그 pick · place 단계의 컵은 <code>UNKNOWN</code>. 실행 전후 표를 <code>history</code>에 남김</td></tr>
+</table>
+<p>'~로'는 도착지 · '원래 자리' = 음료대, 이 두 줄이 없을 때는 되돌리기 문장을 거절했습니다(6/8 → 8/8). 메시지 순서는 system(규칙 + 표) → 예시 → 이전 대화 → 이번 문장이며, <code>world</code>가 없으면 앞 절과 같은 프롬프트라 이전 예제도 그대로 동작합니다.</p>
+<h3>시나리오 3개</h3>
+<table>
+<tr><th>#</th><th>대화</th><th>포인트</th></tr>
+<tr><td>1</td><td>"음료대로 가서 분홍 컵을 집고 2번 상담 테이블에 가져다 드려" → "응"</td><td>기본 운반</td></tr>
+<tr><td>2</td><td>"손님께 음료 한 잔 가져다 드려" → "안쪽 테이블" → "응"</td><td>되묻기 후 이어 붙이기</td></tr>
+<tr><td>3</td><td>"분홍 컵 다시 음료대로 가져와" → "응"</td><td>시나리오 1이 바꾼 표가 있어야 풀림</td></tr>
+</table>
+<p><code>WorldState()</code> 초기값은 세 컵 모두 <code>drinks</code>입니다. 시나리오마다 <code>context</code>는 비우지만(새 대화) world 표는 이어집니다.</p>
+<h3>실습 명령</h3>
+<pre><code>./scripts/robotworld exec python lessons/10_final_project/01_world_plan.py      # 시뮬레이터 없이
+# 터미널 1
+./scripts/robotworld start     # 시뮬레이터 · Nav2 · MoveIt · PickPlace 서버 · Task Manager
+# 터미널 2
+./scripts/robotworld exec python lessons/10_final_project/02_final_mission.py               # 시나리오 3 개 이어서
+./scripts/robotworld exec python lessons/10_final_project/02_final_mission.py --keyboard    # 직접 입력
+# 표가 처음 상태일 때 시나리오 3 만 (코드가 실행을 막는다)
+./scripts/robotworld exec python lessons/10_final_project/02_final_mission.py --dry-run --scenario 3
+# 끝낼 때
+./scripts/robotworld stop      # 이 워크스페이스의 노드를 모두 종료</code></pre>
+<h3>확인 포인트</h3>
+<ul>
+<li>검사는 두 번입니다. <code>validate_world</code>(계획 자체의 모순) → <code>world.check</code>(위치표와의 모순). 단계는 있는데 문제가 있으면 LLM의 reply 대신 "그대로는 실행할 수 없습니다 (이유). 다시 말씀해 주세요."로 되묻습니다.</li>
+<li>시나리오마다 <code>[world]</code> 줄로 표가 어떻게 바뀌었는지 확인합니다.</li>
+</ul>
+<div class="callout warn">남은 프로세스가 있으면 <code>start</code>가 멈춥니다. 실습을 끝낼 때 <code>./scripts/robotworld stop</code>을 꼭 실행합니다.</div>
+</section>
+
+<section class="glass card" id="s5">
+<h2>5. 제어 기법 PID · LQR: 카트-폴 직접 튜닝 (20강)</h2>
+<h3>핵심 개념</h3>
+<p>카트-폴은 조작할 수 있는 것이 카트 힘 <code>u</code> 하나인데 원하는 것은 둘(막대 세우기 + 카트를 목표 위치에)인 under-actuated 시스템입니다. 각도 PID는 막대 각도 하나만 보고, LQR은 위치 · 각도 · 속도 · 각속도 4개를 한꺼번에 봅니다.</p>
+<h3>세 제어기 비교</h3>
+<table>
+<tr><th>제어기</th><th>구조</th><th>관찰 결과 (원본 실험)</th></tr>
+<tr><td>각도 PID</td><td>막대 각도 오차만 0으로</td><td>막대는 1초 안에 서지만 카트가 0.3 m/s로 밀려가고, 외란 뒤 약 5초에 레일 끝(±2.9 m)에서 넘어짐</td></tr>
+<tr><td>캐스케이드 PID</td><td>바깥 루프(위치 → 목표 각도) + 안쪽 루프(각도 PID), 이득 5개 수동</td><td><code>Kx 0.05, Kv 0.1</code>은 20 s에 x = 1.000 m로 멈춤 · <code>Kx 0.1, Kv 0</code>은 10 s에 x = 1.230 m로 출렁임</td></tr>
+<tr><td>LQR</td><td>비용 Q, R에서 K 4개 계산</td><td>기본값으로 10 s에 x = 1.000 m, 외란도 받아냄. R=10이면 느려지고(약 12 s에 1 m), 3 N 외란에서 5.2 s에 넘어짐</td></tr>
+</table>
+<p>이득 변화 예시입니다. <code>Kd 0</code>은 감쇠가 없어 ±5° 진동이 계속, <code>Kp 15</code>는 2.3 s 만에 넘어짐, <code>Ki 50</code>은 밀려남이 줄지만 외란을 넣으면 결국 넘어집니다.</p>
+<pre><code>target x ─▶[바깥 루프: 위치]─▶ θ_ref ─▶[안쪽 루프: 각도 PID]─▶ u ─▶ 카트-폴
+             ▲ x, ẋ                       ▲ θ                         │
+             └────────────────────────────┴───────────────────────────┘
+pid.setpoint = -(kx * (x - target) + kv * x_dot)   # 바깥 루프 (위치 PD)
+u = pid(theta, dt)                                  # 안쪽 루프 (각도 PID)</code></pre>
+<ul>
+<li><strong>부호가 반대인 이유(비최소 위상)</strong>. 카트를 +x로 보내려면 먼저 −x로 살짝 빼서 막대를 +x로 기울여야 합니다. 마이너스 부호를 빼면 카트가 목표에서 멀어지며 넘어집니다.</li>
+<li><strong>안쪽은 빠르게, 바깥은 느리게</strong>. 안쪽 Kp 60 · Kd 8, 바깥 Kx 0.05 · Kv 0.1. 안쪽이 바깥보다 대략 5~10배 빨라야 한다는 것은 일반적 경험칙입니다. Kv는 브레이크 역할입니다.</li>
+<li><strong>캐스케이드도 상태 피드백</strong>. 펼치면 4개 상태에 이득을 곱해 더하는 구조입니다. 캐스케이드(손으로 맞춤) 3.0 / 60 / 6.4 / 8, LQR(Q = diag(10, 100, 1, 1), R = 0.1) 9.8 / 71.7 / 11.5 / 12.6 (위치 / 각도 / 속도 / 각속도).</li>
+</ul>
+<pre><code># lqr.py 핵심: x[k+1] ≈ A x[k] + B u[k] (수치 미분)
+mujoco.mjd_transitionFD(model, data, 1e-6, True, A, B, None, None)
+P = solve_discrete_are(A, B, Q, R)
+K = np.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
+u = -K @ (np.concatenate([data.qpos, data.qvel]) - goal)</code></pre>
+<h3>LQR 과 강화학습</h3>
+<table>
+<tr><th></th><th>LQR</th><th>강화학습 (model-free)</th></tr>
+<tr><td>모델</td><td>필요 (<code>mjd_transitionFD</code>로 A, B)</td><td>불필요, 시뮬레이터를 돌려 배움</td></tr>
+<tr><td>목표</td><td>2차식 비용 Σ(xᵀQx + uᵀRu)</td><td>아무 보상이나</td></tr>
+<tr><td>답</td><td>리카티 방정식 한 번, 수 ms</td><td>수많은 에피소드 학습</td></tr>
+<tr><td>범위</td><td>선형화 지점(똑바로 선 상태) 근처만, swing-up 불가</td><td>비선형 · 힘 제한 · 접촉까지 학습 가능</td></tr>
+</table>
+<p>뿌리는 같습니다. LQR의 xᵀPx가 가치 함수이고 리카티 반복은 가치 반복과 같은 일을 합니다. 실무에서는 섞어 씁니다(강화학습으로 swing-up 후 LQR로 균형).</p>
+<h3>실습 명령 (MuJoCo)</h3>
+<pre><code>cp -r "/mnt/e/Github/MuJoCo + ROS2/pinklab_robotworld2026/lessons/02_control" ~/pinklab_robotworld2026/lessons/
+cd ~/pinklab_robotworld2026 &amp;&amp; source scripts/env.sh
+python lessons/02_control/pid.py                                              # ① 각도 PID
+python lessons/02_control/pid.py --kd 0 --push 0                              # ② 이득
+python lessons/02_control/pid.py --kx 0.05 --kv 0.1 --target 1 --seconds 20   # ③ 캐스케이드
+python lessons/02_control/lqr.py                                              # ④ LQR
+python lessons/02_control/lqr.py --q 1 1 1 1 --r 10 --seconds 20 --push 0
+python lessons/02_control/lqr.py --viewer    # 아무 명령에나 --viewer 를 붙이면 MuJoCo 창
+python lessons/02_control/test_control.py    # ok</code></pre>
+<h3>확인 포인트</h3>
+<ul>
+<li>WSL 실습본(<code>~/pinklab_robotworld2026</code>, 커밋 2b1a52d)에는 이 예제가 아직 없어 위처럼 Windows 쪽 저장소에서 복사합니다.</li>
+<li><code>cartpole.xml</code>: 카트(slide, ±2.9 m, 1 kg) + 막대(hinge, 0.6 m, 0.2 kg), 카트 힘 motor ±20 N. <code>sim.py</code>는 0.5 s마다 출력하고 t=4 s에 막대를 0.1 s 미는 외란을 줍니다.</li>
+<li>외란 0 N으로 놓고 비교하면 이득 차이가 잘 보입니다. 원본 브라우저 페이지의 물리는 근사라 소수점 아래 숫자는 MuJoCo와 다를 수 있습니다.</li>
+</ul>
+</section>
+
+<section class="glass card" id="s6">
+<h2>6. Isaac Sim 확장: 같은 부스를 Isaac Sim 6.2 에서 (21강)</h2>
+<h3>핵심 개념</h3>
+<p>MuJoCo 브리지 자리만 Isaac Sim으로 바꾸고 Nav2 · MoveIt · 집기/놓기 스킬 · Task Manager · 웹 FMS는 원본을 그대로 씁니다(브랜치 <code>isaac-sim</code>, 폴더 <code>isaac/</code>). 원본 실습 파일은 바꾸지 않았습니다.</p>
+<table>
+<tr><th>층</th><th>MuJoCo 실습</th><th>Isaac 경로</th></tr>
+<tr><td>시뮬레이터 · 브리지</td><td><code>mobile_openarm_mujoco</code> (WSL)</td><td><code>isaac/booth_sim.py</code> (Windows, Isaac Sim 6.2)</td></tr>
+<tr><td>팔 · 그리퍼 액션</td><td><code>actions.Controllers</code></td><td>같은 코드 import (<code>isaac/isaac_physics.py</code>가 MuJoCo Physics를 흉내)</td></tr>
+<tr><td>라이다</td><td><code>mj_multiRay</code> 360개</td><td>PhysX 레이캐스트 360개</td></tr>
+<tr><td>카메라 · ArUco</td><td>브리지 안 핸들러</td><td><code>/isaac/&lt;카메라&gt;/image_raw</code> → WSL <code>isaac/wsl/vision_bridge.py</code>가 원본 <code>ArucoDetector</code>로 처리</td></tr>
+<tr><td>실행 래퍼</td><td><code>./scripts/robotworld</code> · 도메인 44</td><td><code>isaac/wsl/robotworld-isaac</code> · 도메인 45 · Fast DDS</td></tr>
+</table>
+<p>도메인이 달라 MuJoCo 실습과 동시에 띄워도 섞이지 않습니다. 필요한 것은 Windows의 <code>C:\isaacsim-6.2</code>, WSL Ubuntu 24.04 + ROS 2 Jazzy, 빌드된 워크스페이스(<code>~/pinklab_robotworld2026</code>)입니다.</p>
+<h3>실습 명령</h3>
+<pre><code># 준비: 자산 내보내기 (WSL, 처음 한 번)
+cd "/mnt/e/Github/MuJoCo + ROS2/pinklab_robotworld2026-isaac"
+isaac/wsl/robotworld-isaac export
+isaac/wsl/robotworld-isaac env     # 워크스페이스 · 내보내기 폴더 · 도메인 45 확인
+
+# ① 자체 점검 (Windows)
+cd "E:\Github\MuJoCo + ROS2\pinklab_robotworld2026-isaac"
+C:\isaacsim-6.2\python.bat isaac\booth_sim.py --headless --seconds 60
+
+# ② 컵 하나 옮기기
+C:\isaacsim-6.2\python.bat isaac\booth_sim.py           # Windows, [ISAAC-BOOTH] ready 대기
+isaac/wsl/robotworld-isaac start                        # WSL 터미널 1
+isaac/wsl/robotworld-isaac pick pink drinks consult_2   # WSL 터미널 2
+isaac/wsl/robotworld-isaac stop                         # 끝낼 때 (Windows 쪽은 창을 닫는다)
+
+# ③ Task Manager 에 계획 보내기
+isaac/wsl/robotworld-isaac exec python3 lessons/08_lmm/07_run_plan.py \
+  navigate:drinks pick:cup_pink@drinks navigate:consult_2 place:@consult_2
+
+# ④ 웹 FMS
+isaac/wsl/robotworld-isaac fms     # 브라우저에서 http://localhost:8080</code></pre>
+<p>빌드된 워크스페이스가 다른 곳이면 <code>ROBOTWORLD_WS=&lt;경로&gt;</code>를 앞에 붙입니다. 시작 위치를 바꾸면 <code>booth_sim.py --spawn drinks</code>와 <code>robotworld-isaac start spawn:=drinks</code>를 같게 줍니다.</p>
+<h3>두 물리 엔진의 차이 (이식하며 부딪힌 것)</h3>
+<table>
+<tr><th>현상</th><th>원인</th><th>Isaac 쪽 처리</th></tr>
+<tr><td>멈춤 뒤 56 mm 더 굴러 도킹이 깊어짐 (운반 2/5)</td><td>URDF 변환이 관절 armature를 0으로 둠</td><td>회전 0.01 · 직선 0.001 → 14.7 mm (MuJoCo 13 mm), 운반 5/5</td></tr>
+<tr><td>회전 직후 마커 방향이 약 7° 늦음</td><td>실시간 렌더 = 경로 추적 + DLSS(이전 프레임 혼합)</td><td>물리를 멈춘 채 같은 자세로 6번 더 렌더 (<code>--camera-subframes 0</code>으로 비교)</td></tr>
+<tr><td>쥔 컵이 튀어 나감</td><td>GPU PhysX 손가락-컵 접촉 발산</td><td>CPU PhysX (0.37 → 0.60배로 오히려 빨라짐)</td></tr>
+<tr><td>바퀴가 떠서 헛돎</td><td>원기둥을 다각형으로 근사해 반지름 감소</td><td>같은 반지름의 구 접촉</td></tr>
+<tr><td>그리퍼가 컵을 쓰러뜨림</td><td>PhysX가 URDF mimic을 적용하지 않음</td><td>finger_joint2를 joint1과 같은 목표로 따로 구동</td></tr>
+</table>
+<div class="callout ok">교훈. 시뮬레이터를 옮기면 먼저 "0.1 m/s에서 멈추면 몇 mm 미끄러지나" 같은 단순한 동역학을 원본과 맞춰 봅니다. 운반 실패의 원인은 도킹 코드가 아니라 바퀴 하나의 관성이었습니다.</div>
+<h3>LLM 을 Claude API 로 바꾸기 (<code>claude-llm</code> 브랜치)</h3>
+<p>모든 LLM 호출이 <code>warehouse_lecture/llm/client.py</code> 한 파일을 거치므로 이 파일과 설정만 바꾸면 Task Manager · FMS · 실습 08이 그대로 Claude로 돕니다. 모델은 <code>claude-haiku-5-5</code>이며 호출하는 쪽은 한 줄도 바꾸지 않았습니다.</p>
+<table>
+<tr><th>바뀐 곳</th><th>OpenAI (원본)</th><th>Claude</th></tr>
+<tr><td>키 (<code>.env</code>)</td><td><code>OPENAI_API_KEY</code></td><td><code>ANTHROPIC_API_KEY</code></td></tr>
+<tr><td>system 프롬프트</td><td><code>messages</code> 안 <code>role: system</code></td><td>따로 <code>system=</code> 인자</td></tr>
+<tr><td>구조화 출력</td><td><code>chat.completions.parse(response_format=…)</code></td><td><code>messages.parse(output_format=…)</code> → <code>parsed_output</code></td></tr>
+<tr><td>무작위성</td><td><code>temperature: 0.2</code></td><td>보내지 않음, 대신 <code>effort: low</code></td></tr>
+<tr><td>출력 한도</td><td><code>max_output_tokens: 800</code></td><td>16000 (생각 토큰 포함)</td></tr>
+<tr><td>패키지</td><td><code>openai</code></td><td><code>anthropic</code> 2.x + <code>Brotli&gt;=1.2</code></td></tr>
+</table>
+<pre><code>cd ~/rwc
+isaac/wsl/robotworld-isaac exec bash -c 'source ~/.cache/claude_llm/install/local_setup.bash; python3 lessons/08_lmm/06_plan_accuracy.py'
+# WSL 터미널 1 (Task Manager 도 Claude 판으로 뜬다)
+isaac/wsl/robotworld-isaac exec bash -c 'source ~/.cache/claude_llm/install/local_setup.bash; exec python3 "$(command -v ros2)" launch isaac/wsl/booth_isaac.launch.py mode:=nav'
+# WSL 터미널 2
+isaac/wsl/robotworld-isaac exec bash -c 'source ~/.cache/claude_llm/install/local_setup.bash; python3 lessons/08_lmm/08_text_mission.py'</code></pre>
+<h3>확인 포인트</h3>
+<ul>
+<li>자체 점검 로그 순서는 <code>[ISAAC-BOOTH] converted ...</code>(첫 실행 · <code>--reimport</code> 때만) → <code>[ISAAC-BOOTH] ready | domain 45</code> → <code>CHECK PASS</code> 7줄 → <code>REALTIME 0.6x</code> 안팎 → <code>SELF-CHECK PASS</code>입니다. 앞의 수백 줄 시작 로그는 정상이며, <code>CHECK FAIL</code>이면 그 줄 끝 값이 원인입니다.</li>
+<li>원본 확인 결과(2026-11-19)는 자체 점검 PASS · 실시간 0.63배, 운반 홈 출발 5회 중 5회 성공(컵은 슬롯에서 0.1~4.0 cm), Task Manager 계획 <code>steps_done=4/4</code>입니다. 실시간 약 0.6배라 운반 한 번에 5~6분 걸립니다.</li>
+<li>Claude 판 확인(2026-11-22)은 <code>06_plan_accuracy.py</code> 19/20 (95 %), 20회 비용 $0.0092, 평균 1.7 s입니다.</li>
+<li>터미널 1을 <code>exec ros2 launch …</code>로 띄우면 시스템 python이 쓰여 <code>vision_bridge</code>가 <code>No module named 'mujoco'</code>로 죽고 마커를 못 찾습니다. <code>python3 "$(command -v ros2)" launch</code>로 venv python을 씁니다.</li>
+</ul>
+<div class="callout warn">제약. 움직이는 사람(<code>/warehouse/actor_states</code>)과 정답 검출기(<code>/vision/detections</code>)가 없어 <code>detect</code> 단계를 쓸 수 없습니다. 부스 벽 텍스처 · 조명은 단색입니다. Isaac Sim 6.2 공식 최소 사양은 RTX 4080 16 GB이며 원본 수치는 RTX 3070 8 GB 기준입니다. OpenAI로 LLM 단계는 확인하지 못했습니다(키 만료 401, 크레딧 없음 429).</div>
+</section>
+
+<section class="glass card" id="s7">
+<h2>7. 정리</h2>
+<h3>핵심 정리</h3>
+<ul>
+<li>LLM은 문장을 정해진 스키마(<code>RobotCommand</code>, <code>RobotPlan</code>)로 바꾸는 일만 맡고, Enum과 <code>response_format</code>으로 형식을, <code>validate_world</code>로 의미를 코드가 보장합니다.</li>
+<li>모호하거나 위험한 문장은 추측하지 않고 <code>answer</code> / 빈 steps + reply로 되묻거나 거부합니다.</li>
+<li>Task Pipeline은 계획을 here · held로 따라가며 빠진 navigate를 자동으로 끼워 넣고, <code>/execute_plan</code>은 실패 단계에서 멈추고 <code>steps_done</code> · <code>failed_step</code> · <code>spoken</code>으로 보고합니다.</li>
+<li>Web FMS는 SSE(0.2 s)로 상태를 밀어 주고, dead-man(0.4 s) · 서버 속도 제한 · <code>cancel_all</code>로 안전을 지킵니다.</li>
+<li>Final Mission의 핵심은 "LLM은 의도, 코드는 사실"입니다. <code>WorldState</code>가 위치표를 프롬프트로 주고, <code>check</code>로 막고, <code>apply</code>로 실제 끝난 단계만 반영합니다.</li>
+<li>카트-폴에서 각도 PID는 카트가 밀려가고, 캐스케이드는 이득 5개를 손으로, LQR은 Q · R에서 4개 이득을 계산합니다. 반대 부호(비최소 위상)는 LQR의 K 안에 자동으로 들어갑니다.</li>
+<li>Isaac Sim 이식은 브리지만 바꾸고 상위 스택을 그대로 씁니다. 실패 원인은 상위 코드보다 단순한 동역학 차이(armature, 접촉, 렌더 지연)에 있었습니다.</li>
+</ul>
+<h3>스스로 점검</h3>
+<ol>
+<li>JSON 스키마 검증만으로는 막을 수 없고 <code>validate_world</code>나 <code>world.check</code>가 막아야 하는 계획의 예를 두 가지 들어 보세요.</li>
+<li>FMS에서 브라우저 탭을 닫았을 때 로봇이 멈추는 이유를 <code>teleop_tick</code>의 시간 조건으로 설명해 보세요.</li>
+<li>캐스케이드 PID 바깥 루프 식에서 마이너스 부호를 빼면 어떤 일이 생기고, 왜 그런가요?</li>
+</ol>
+</section>
+
+</main>
+<footer class="glass pager"><a href="04_manipulation.html">← 이전 장</a><a href="index.html">목차</a><a href="index.html">다음 장 →</a></footer>
+</div></body></html>

@@ -1,0 +1,271 @@
+<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4장. MoveIt 양팔 · 엔드이펙터 제어 · Pick &amp; Place · 컵 배달 | Sim-ROS2</title><link rel="stylesheet" href="assets/style.css"></head>
+<body><!-- 4장: MoveIt 양팔 계획·엔드이펙터 제어·Pick & Place·주행 컵 배달을 압축한 교육 페이지 -->
+<div class="wrap">
+<header class="glass hero"><div class="kicker">Sim-ROS2 · 5장 압축 교육자료 · 4/5</div><h1>4장. MoveIt 양팔 · 엔드이펙터 제어 · Pick &amp; Place · 컵 배달</h1><p>바퀴 다음은 팔이다. MoveIt으로 양팔을 계획·실행하고, 손끝(TCP) 자세와 직선 경로·그리퍼로 컵을 집고 놓은 뒤, Nav2 주행과 묶어 부스를 가로지르는 컵 배달까지 하나의 goal로 완성한다. 원본 12~15강.</p></header>
+
+<nav class="glass toc" aria-label="목차"><ol>
+<li><a href="#s1">MoveIt + MuJoCo: 양팔 계획과 실행 (12강)</a></li>
+<li><a href="#s2">엔드이펙터 제어: IK · Cartesian · 그리퍼 (13강)</a></li>
+<li><a href="#s3">Pick &amp; Place: 도킹 · 위치 확인 · 집고 놓기 (14강)</a></li>
+<li><a href="#s4">Navigation + Pick &amp; Place: 컵 배달 (15강)</a></li>
+<li><a href="#s5">정리</a></li>
+</ol></nav>
+
+<main>
+
+<section class="glass card" id="s1">
+<h2>1. MoveIt + MuJoCo: 양팔 계획과 실행</h2>
+
+<h3>핵심 개념</h3>
+<p>MoveIt은 관절 목표를 받아 충돌 없는 궤적을 <strong>계획</strong>하고, 그 궤적을 컨트롤러 액션으로 보내 <strong>실행</strong>한다. 이 저장소에서는 MuJoCo 브리지가 컨트롤러 액션 서버 역할을 맡는다. 계획 대상은 SRDF의 <strong>Planning Group</strong>이고, 자주 쓰는 자세는 SRDF <code>group_state</code>로 이름을 붙여 둔다.</p>
+<table>
+<tr><th>개념</th><th>이 저장소에서의 내용</th></tr>
+<tr><td>Planning Group</td><td><code>left_arm</code> · <code>right_arm</code>은 팔마다 7 관절, <code>both_arms</code>는 두 팔을 묶어 14 관절을 한 번에 계획, <code>left_gripper</code> 등 그리퍼는 손가락 관절 1개짜리 별도 그룹</td></tr>
+<tr><td>이름 자세 (group_state)</td><td><code>transport</code> · <code>ready</code> · <code>hands_up</code> · <code>home</code>. <code>ready</code>는 <code>joint4</code>만 1.65 rad, 나머지 0. <code>home</code>은 모든 관절 0</td></tr>
+<tr><td>end_effector</td><td><code>left_ee</code> (parent_link <code>openarm_left_hand</code>, group <code>left_gripper</code>)</td></tr>
+<tr><td>virtual_joint</td><td><code>odom</code> → <code>base_footprint</code>를 평면 이동(planar) 관절로 선언</td></tr>
+<tr><td>disable_collisions</td><td>충돌 검사에서 제외할 링크 쌍(인접 링크 등) 110쌍</td></tr>
+<tr><td>Planning Scene</td><td>MoveIt이 아는 장애물. RViz Scene Objects에서 확인</td></tr>
+</table>
+
+<h3>구조: 계획에서 실행까지</h3>
+<div class="flow"><span><code>arm</code> 명령 / RViz</span><b>→</b><span><code>/move_action</code> (MoveGroup)</span><b>→</b><span>OMPL 계획 (RRTConnect)</span><b>→</b><span><code>/left_joint_trajectory_controller/follow_joint_trajectory</code></span><b>→</b><span>MuJoCo 브리지 <code>actions.py</code></span><b>→</b><span>position 액추에이터 <code>data.ctrl</code></span></div>
+<table>
+<tr><th>설정 파일</th><th>역할</th></tr>
+<tr><td><code>config.py</code> <code>parameters()</code></td><td><code>robot_description</code> = URDF(<code>expand_urdf()</code>), <code>robot_description_semantic</code> = SRDF, kinematics = KDL, <code>joint_limits.yaml</code> = 속도·가속 한계, <code>planning_pipelines: ["ompl"]</code>, <code>use_sim_time: True</code>, <code>moveit_manage_controllers: False</code>, <code>trajectory_execution.allowed_start_tolerance: 0.05</code>, <code>publish_planning_scene: True</code></td></tr>
+<tr><td><code>moveit_controllers.yaml</code></td><td><code>MoveItSimpleControllerManager</code>. 컨트롤러 4개(팔 2 + 그리퍼 2). 팔 = <code>FollowJointTrajectory</code> (<code>action_ns: follow_joint_trajectory</code>), 그리퍼 = <code>GripperCommand</code> (<code>action_ns: gripper_cmd</code>)</td></tr>
+<tr><td><code>joint_goal.py</code></td><td>group 선택, <code>allowed_planning_time = 8.0</code>, <code>num_planning_attempts = 5</code>, 속도·가속 비율 0.3, <code>start_state.is_diff = True</code>(현재 <code>/joint_states</code>에서 출발), 관절 허용 범위 ± 0.01 rad</td></tr>
+</table>
+<div class="callout">컨트롤러 이름 + <code>action_ns</code>가 브리지가 여는 액션 이름과 <strong>같아야</strong> 연결된다. MoveIt은 컨트롤러를 켜고 끄지 않고 브리지 액션을 그대로 쓴다.</div>
+
+<h3>브리지 쪽 실행 규칙</h3>
+<table>
+<tr><th>단계</th><th>동작</th></tr>
+<tr><td>goal 수락 검사</td><td>같은 컨트롤러가 실행 중(<code>reserved</code>)이거나 베이스 <code>twist</code>·<code>command</code>가 0.04를 넘으면 REJECT. <code>validate_trajectory</code>로 관절 이름·시간 순서·관절 한계(<code>jnt_range</code>) 검사. 수락 시 베이스 명령 0</td></tr>
+<tr><td>궤적 추종</td><td>sim 시간 기준 경과 시간 t로 샘플링. 속도가 있으면 Hermite 3차, 없으면 직선 보간. 범위 밖 t는 첫 점·마지막 점 유지</td></tr>
+<tr><td>성공 판정</td><td>궤적 시간이 끝나고 실측 관절이 목표 ± 0.035 rad 안이면 SUCCESSFUL. 3 s(<code>goal_time_tolerance</code>) 더 기다려도 못 들어오면 <code>GOAL_TOLERANCE_VIOLATED</code>로 abort. 요청에 tolerance가 있으면 그 값 우선</td></tr>
+<tr><td>팔·바퀴 인터록</td><td>팔 액션 실행 중이거나 두 팔이 주행 자세 ± 0.15 rad 밖이면 <code>/cmd_vel</code>을 0으로. 속도는 ± 0.35 m/s · ± 0.7 rad/s로 자름(<code>mujoco.yaml</code>). 0.5 s 동안 새 명령이 없으면 정지. NaN·inf 명령은 버림</td></tr>
+</table>
+
+<h3>실습 명령</h3>
+<pre><code># 터미널 1: 시뮬레이터 + MoveIt (Nav2 없음)
+source /opt/ros/jazzy/setup.bash
+source scripts/env.sh
+./scripts/robotworld moveit viewer:=true rviz:=true
+
+# 터미널 2: 노드·액션·서비스 확인
+ros2 node list
+ros2 action list
+ros2 action info /left_joint_trajectory_controller/follow_joint_trajectory
+ros2 service list | grep -E 'ik|cartesian|plan|scene' | grep -v warehouse_planning_scene/
+
+# 터미널 3: 이름 자세로 팔 움직이기
+time ./scripts/robotworld arm both ready          # arm &lt;left|right|both&gt; &lt;transport|ready|hands_up|home&gt;
+./scripts/robotworld arm both hands_up
+./scripts/robotworld arm both transport
+./scripts/robotworld arm both home                # 모든 관절 0</code></pre>
+
+<h3>확인 포인트</h3>
+<ul>
+<li><code>joint_goal.py</code>는 <code>error_code</code>가 1(SUCCESS)이 아니면 종료 코드 1로 끝난다. -4는 <code>CONTROL_FAILED</code>. <code>plan_only</code> True면 계획만, False면 계획 후 실행까지.</li>
+<li><strong>계획은 됐는데 실행이 실패할 때</strong>를 <code>arm both home</code>으로 재현한다. MoveIt은 계획 성공을 알렸어도 실행 단계 실패는 컨트롤러 결과로 전달된다. 터미널 1 로그와 결과 코드를 함께 본다.</li>
+<li>RViz MotionPlanning 패널에서 Plan &amp; Execute, Goal State를 <code>&lt;random valid&gt;</code>로 두고 Plan만 여러 번 하면 OMPL 경로가 매번 달라진다.</li>
+<li>해 볼 것: <code>arm left ready</code>와 <code>arm both ready</code> 비교, <code>max_velocity_scaling_factor</code>를 0.1로 바꿔 <code>time</code> 비교.</li>
+</ul>
+</section>
+
+<section class="glass card" id="s2">
+<h2>2. 엔드이펙터 제어: IK · Cartesian · 그리퍼</h2>
+
+<h3>핵심 개념</h3>
+<p>관절 공간(이름 자세)에서 <strong>작업 공간</strong>(손끝 위치)으로 넘어간다. 목표는 <code>base_footprint</code> 기준 TCP(<code>openarm_left_hand_tcp</code>) 위치이고, 손 방향은 기본값 <code>GRASP_FORWARD</code>(손끝이 앞 +x, 손가락이 좌우 y로 닫히는 수평 파지)를 쓴다. IK는 손끝 자세 하나를 관절 7개로 바꾸는데, 같은 손끝에도 팔 모양(해)이 여러 개다.</p>
+<table>
+<tr><th>방식</th><th>서비스/액션</th><th>특징</th></tr>
+<tr><td>pose goal</td><td><code>/compute_ik</code> → <code>/move_action</code></td><td>IK로 관절값을 구해 관절 목표로 계획. 허용 범위 ± 0.001 rad → 손끝 약 1 mm (± 0.01이면 수 mm ~ 1 cm)</td></tr>
+<tr><td>Cartesian path</td><td><code>/compute_cartesian_path</code> → <code>/execute_trajectory</code></td><td>손끝이 waypoint까지 직선. <code>max_step</code> 0.01 m마다 IK. 계획(서비스)과 실행(액션)이 나뉨. <code>fraction</code> 0.9 미만이면 실행 안 함</td></tr>
+<tr><td>그리퍼</td><td><code>gripper_cmd</code> (GripperCommand)</td><td>목표 = 손가락 위치 [m] + 최대 힘 [N]. 결과 <code>position</code> · <code>reached_goal</code> · <code>stalled</code></td></tr>
+</table>
+
+<h3>흐름: IK 해 고르기</h3>
+<div class="flow"><span>시드 = 현재 관절값</span><b>→</b><span><code>/compute_ik</code> × <code>ik_attempts</code> 12회 (각 0.2 s)</span><b>→</b><span>성공한 해 중 시드와 거리(norm) 최소</span><b>→</b><span><code>move_joints</code> (± 0.001 rad)</span></div>
+<p>가장 덜 움직이는 해를 골라 팔이 크게 휘돌지 않게 한다. 해가 하나도 없으면 <code>SkillError</code>. <code>avoid_collisions</code>로 충돌하는 해는 제외한다.</p>
+
+<h3>그리퍼 판정 (브리지)</h3>
+<table>
+<tr><th>상태</th><th>조건</th></tr>
+<tr><td>reached</td><td>목표 위치 ± 2 mm 안 (<code>goal_tolerance</code>)</td></tr>
+<tr><td>stalled</td><td>못 닿은 채 1 s 동안 0.1 mm도 안 움직임 → 물체에 막힘 = 잡았음</td></tr>
+<tr><td>abort</td><td>6 s 넘게 둘 다 아님</td></tr>
+</table>
+<p>reached·stalled 둘 다 succeed이므로, 잡았는지는 호출한 쪽이 <code>stalled</code>·<code>position</code>으로 판단한다. 베이스 주행 중이거나 같은 그리퍼가 실행 중이면 goal이 거부된다.</p>
+
+<h3>설정 값 (<code>skills.yaml</code>의 moveit 블록)</h3>
+<pre><code>moveit:
+ planning_time: 5.0
+ attempts: 4
+ velocity_scaling: 0.35
+ acceleration_scaling: 0.35
+ ik_attempts: 12
+ cartesian_step: 0.01
+ cartesian_min_fraction: 0.9
+arms:
+ left: {shoulder_y: 0.093, tcp_link: openarm_left_hand_tcp, group: left_arm, gripper: left_gripper_controller, hand_link: openarm_left_hand}</code></pre>
+
+<h3>실습 명령</h3>
+<pre><code># 터미널 1
+./scripts/robotworld moveit viewer:=true rviz:=true
+
+# 터미널 2
+./scripts/robotworld exec python lessons/05_moveit/ee_control.py where              # 두 TCP 위치 (TF)
+./scripts/robotworld exec python lessons/05_moveit/ee_control.py named both ready
+./scripts/robotworld exec python lessons/05_moveit/ee_control.py ik left 0.45 0.20 0.95   # 계산만, 팔은 안 움직인다
+time ./scripts/robotworld exec python lessons/05_moveit/ee_control.py pose left 0.45 0.20 0.95
+time ./scripts/robotworld exec python lessons/05_moveit/ee_control.py cartesian left 0 0 -0.05   # 지금 TCP 에서 5 cm 아래로 직선
+./scripts/robotworld exec python lessons/05_moveit/ee_control.py gripper left close
+./scripts/robotworld exec python lessons/05_moveit/ee_control.py gripper left open
+time ./scripts/robotworld exec python lessons/05_moveit/ee_control.py demo   # ready → pose → 아래 5 cm → 닫기 · 열기 → 위 5 cm → transport</code></pre>
+
+<h3>확인 포인트</h3>
+<ul>
+<li>일부러 실패시키기: <code>pose left 0.65 0.20 0.95</code>(너무 멀다), <code>cartesian left 0.3 0 0</code>(앞으로 30 cm 직선). 도달 범위 밖이면 IK 해가 없고, 직선은 <code>fraction</code>이 부족해 실행되지 않는다.</li>
+<li><code>cartesian left 0 0.1 0</code>과 <code>cartesian left 0 -0.1 0</code>을 비교해 몸통 쪽으로는 몇 %까지 가는지 본다.</li>
+<li><code>move_joints</code>의 tolerance를 0.01 · 0.05로 넓혀 pose 오차와 계획 시간을 비교한 뒤 0.001로 되돌린다.</li>
+</ul>
+</section>
+
+<section class="glass card" id="s3">
+<h2>3. Pick &amp; Place: 도킹 · 위치 확인 · 컵 집고 놓기</h2>
+
+<h3>핵심 개념</h3>
+<p>도킹·인식·팔 동작을 <strong>PickPlace 액션</strong>(<code>/pick_place</code>) 하나의 스킬로 묶는다. goal의 <code>phase</code>로 pick 절반·place 절반만 실행할 수 있고, 비우면 <code>all</code>이다. pick이 끝나면 서버가 <code>self.held</code>에 물체·팔을 기억해 두고 place가 이어받는다. 성공은 명령이 아니라 <strong>시뮬레이터 정답 위치</strong>로 판정한다.</p>
+
+<h3>흐름: pick 절반 → place 절반</h3>
+<div class="flow"><span>팔 transport</span><b>→</b><span>마커 도킹</span><b>→</b><span>위치 확인 (base_footprint)</span><b>→</b><span>pre-grasp → 직선 접근</span><b>→</b><span>닫기·확인·attach</span><b>→</b><span>들기·뒤로</span><b>→</b><span>carry 자세</span><b>→</b><span>0.75 m 후진</span></div>
+<div class="flow"><span>슬롯 뒤·위</span><b>→</b><span>앞으로 12 cm</span><b>→</b><span>아래로 4 cm</span><b>→</b><span>열기·detach</span><b>→</b><span>뒤로 빼기</span></div>
+
+<table>
+<tr><th>단계</th><th>핵심 내용</th></tr>
+<tr><td>팔 선택</td><td>컵의 offset 부호로 가까운 어깨 쪽 팔(음수 → 오른팔). <code>goal.arm</code>이 있으면 그 팔. 도킹 뒤 실제로 본 좌우 값 <code>rel[1]</code>로 다시 결정</td></tr>
+<tr><td>도킹</td><td>마커 두 개가 0.8 s 안에 함께 보일 때만 사용. <code>visual_end_dx</code> 0.80 m까지 마커 서보(P 제어, 0.1 s마다 <code>/cmd_vel</code>), 그 뒤 <code>target_dx</code> 0.43 m까지 오도메트리 직진. v는 0.03 ~ <code>max_speed</code>, w는 ± 0.3 rad/s 제한. 컵이 축에서 0.25 m 넘게 떨어지면 옆으로 도킹(최대 0.2 m)</td></tr>
+<tr><td>위치 확인</td><td><code>TruthLocator</code>가 <code>/warehouse/object_poses</code>(컵 세 개의 world 자세)를 읽고 <code>/ground_truth</code> 로봇 자세로 <code>base_footprint</code> 좌표(dx 앞, dy 왼쪽)로 바꿈. 기본 <code>locate:=truth</code>, 카메라 검출(YOLO)은 쓰지 않음. 실행 예: <code>cup_pink at dx=0.512 dy=+0.150 z=0.795</code></td></tr>
+<tr><td>잡기</td><td>z = 물체 중심 + 2 cm. 그리퍼 44 mm로 열고, pre-grasp를 컵 뒤 10 cm → 6 cm → 3 cm 순으로 시도. 마지막 접근은 Cartesian 직선이라 컵을 옆에서 치지 않음</td></tr>
+<tr><td>IK 해 거르기</td><td><code>move_pose_then_cartesian</code>: 같은 손끝 자세의 여러 해마다 직선 경로를 먼저 계획해 보고 <code>fraction</code> 0.9 이상(뒤 경로까지 0.999 이상)인 해로만 팔을 움직임</td></tr>
+<tr><td>잡힘 확인</td><td>12 mm 명령 → 컵에 막혀 멈춤. 멈춘 위치가 <code>close_min</code> ~ <code>close_max</code>(16 ~ 28 mm) 밖이면 <code>grasp missed</code>. 50 mm 컵이면 실측 26.9 mm. <code>attach</code>로 컵을 planning scene에서 팔 일부로 등록</td></tr>
+<tr><td>운반</td><td>4 cm 위 → 14 cm 뒤를 Cartesian 한 번으로. carry 손끝 (0.34, 0.153, 0.86)까지 직선으로 당긴 뒤 <code>move_named</code>로 carry 관절값 맞춤. 브리지는 팔이 주행 자세(<code>drive_poses.yaml</code>)일 때만 <code>/cmd_vel</code>을 받음</td></tr>
+<tr><td>성공 판정</td><td>pick: 윗면보다 2 cm 넘게 들림. place: 슬롯 중심 8 cm 안 + 윗면 위</td></tr>
+</table>
+<div class="callout warn">손 방향을 유지하는 직선 이동 덕분에 운반 중 기울기는 2° 이내(실측)다. 이름 자세(관절 목표)로만 가면 손 방향이 정해지지 않아, 예전 hands_up 운반에서는 컵이 약 155° 뒤집혔다.</div>
+
+<h3>설정 값 (<code>skills.yaml</code>)</h3>
+<table>
+<tr><th>블록</th><th>값</th></tr>
+<tr><td>dock</td><td><code>target_dx: 0.43</code>, <code>visual_end_dx: 0.80</code>, <code>max_speed: 0.10</code>, <code>blind_speed: 0.06</code>, <code>gain: 0.6</code>, <code>lateral_gain: 1.2</code>, <code>heading_gain: 0.4</code>, <code>timeout_s: 180.0</code>, <code>undock_distance: 0.75</code></td></tr>
+<tr><td>grasp</td><td><code>pre_offset_x: -0.10</code>, <code>lift_z: 0.04</code>, <code>retreat_x: -0.14</code>, <code>z_offset: 0.02</code>, <code>open: 0.044</code>, <code>close: 0.012</code>, <code>close_min: 0.016</code>, <code>close_max: 0.028</code>, <code>effort: 25.0</code></td></tr>
+<tr><td>place</td><td><code>pre_offset_x: -0.12</code>, <code>drop_z: 0.004</code>, <code>slot_offsets_y: [-0.25, 0.0, 0.25]</code>, <code>x_from_edge: 0.055</code>, <code>carry_pose: carry</code>, <code>carry_tcp: [0.34, 0.153, 0.86]</code></td></tr>
+</table>
+<p>놓는 자리는 스테이션마다 <code>stations.&lt;이름&gt;.slots</code>로 정한다(음료대 15 cm 간격, 둥근 상담 테이블 10 cm 간격). <code>slot_offsets_y</code>는 기본값이다.</p>
+
+<h3>실습 명령</h3>
+<pre><code># 터미널 1: 로봇을 음료대 앞(사전 도킹 지점)에 놓고 시작
+./scripts/robotworld start spawn:=drinks viewer:=true rviz:=false
+
+# 터미널 2: 분홍 컵을 집고, 음료대의 빈 자리에 다시 놓기
+time ./scripts/robotworld exec python lessons/06_pick_place/pick_then_place.py pink
+
+# 실패 재현: 든 것이 없는데 놓기
+./scripts/robotworld exec python lessons/06_pick_place/pick_then_place.py pink --only place
+
+# 같은 일을 CLI 로
+./scripts/robotworld pick pink --phase pick                    # 집은 채 멈춘다
+./scripts/robotworld pick pink drinks drinks --phase place     # 인자: 색 · 출발 스테이션 · 놓을 스테이션 (기본 consult_1)</code></pre>
+
+<h3>확인 포인트</h3>
+<ul>
+<li>feedback 한 줄마다 경과 시간·phase·detail이 출력된다. <code>spin_once</code>를 돌려야 feedback 콜백이 불리고, 전체 제한 시간은 기본 600 s다.</li>
+<li><code>--only place</code>를 먼저 부르면 <code>nothing is held: run the pick phase first</code>로 실패한다.</li>
+<li><code>blue</code> · <code>yellow</code>로 바꿔 feedback의 <code>-&gt; left arm / right arm</code>과 놓는 슬롯을 비교한다.</li>
+<li><code>grasp.close_max</code>를 0.020으로 좁히면 <code>grasp missed</code>가 나고 <code>recover()</code>로 팔이 풀려나는 과정을 볼 수 있다. 끝나면 0.028로 되돌린다.</li>
+</ul>
+</section>
+
+<section class="glass card" id="s4">
+<h2>4. Navigation + Pick &amp; Place: 부스를 가로지르는 컵 배달</h2>
+
+<h3>핵심 개념</h3>
+<p>3절과 <strong>같은 서버·같은 함수</strong>를 쓰되 <code>phase="all"</code> goal 하나에 출발·도착 스테이션을 함께 지정한다. 달라진 것은 스테이션 사이를 Nav2로 가는 것뿐이다. 정밀도는 역할을 나눠 맡는다. Nav2는 스테이션 앞 <code>base_goal</code>(가장자리에서 약 1 m 앞)까지만 가고, 마지막 구간은 마커 도킹이 맡는다. 슬롯 위치도 map이 아니라 도킹 결과(<code>mdx</code> · <code>mdy</code>) 기준이라 Nav2 오차와 무관하다.</p>
+
+<h3>흐름: 상태 기계</h3>
+<div class="flow"><span>navigate_pick</span><b>→</b><span>dock</span><b>→</b><span>locate</span><b>→</b><span>grasp</span><b>→</b><span>carry</span><b>→</b><span>navigate_place</span><b>→</b><span>dock</span><b>→</b><span>place</span><b>→</b><span>retreat</span></div>
+<table>
+<tr><th>단계</th><th>동작</th></tr>
+<tr><td>Nav2 이동</td><td><code>locations.yaml</code>의 <code>base_goal</code>로 <code>NavigateToPose</code>(frame <code>map</code>). 거부되면 SkillError, 180 s 넘거나 취소 요청이면 <code>cancel_goal_async</code>. SUCCEEDED가 아니면 <code>go_to</code>가 한 번 더 보냄. 도착 뒤 <code>settle()</code>로 멈추고 1 s</td></tr>
+<tr><td>옆 오차 보정</td><td>멈춘 뒤 찍힌 마커 쌍으로 along · side · turn 계산. 옆 오차가 5 cm(<code>max_lateral_error</code>)를 넘으면 90° 돌아 옆걸음(<code>sidestep</code>). 최대 2번 보정, 그래도 10 cm 넘게 남으면 SkillError</td></tr>
+<tr><td>place 절반</td><td><code>free_slot_offset</code>으로 든 팔 쪽부터 빈 슬롯 선택 → 도킹 → 놓기 → 팔 transport → <code>undock_distance</code> 후진</td></tr>
+</table>
+
+<h3>카메라가 늦을 때</h3>
+<p>느린 PC는 영상을 찍은 지 한참 뒤에 발행한다. 방금 받았어도 회전 중 영상일 수 있다. 그래서 받은 시각(벽시계, <code>max_age</code>)과 찍힌 시각(sim 시간, <code>since</code>)을 둘 다 거른다. 이 문제는 같은 코드로 창고 강좌를 만들 때 겪은 기록이고, 부스에서는 고친 코드를 그대로 쓴다.</p>
+<table>
+<tr><th>고친 곳</th><th>내용</th></tr>
+<tr><td><code>marker()</code></td><td>받은 지 <code>max_age</code> 안 + 찍힌 시각이 <code>since</code> 이후인 것만 사용</td></tr>
+<tr><td><code>wait_markers()</code></td><td><code>since = self.now()</code>(부른 순간 = 로봇이 멈춘 뒤). <code>need=2</code>로 두 마커 모두 보여야 통과. 안 보이면 제자리에서 좌우로 돌며 찾음</td></tr>
+<tr><td><code>turn()</code></td><td>deadline = 예상 회전 시간 + 3 s를 <strong>sim 시간</strong>으로 잼(전: 벽시계 → 느린 PC에서 90°가 80°로 끊김). 시뮬레이터가 멈춘 경우만 벽시계 guard(4배)로 막음. <code>/odom</code> yaw 변화량을 <code>atan2(sin, cos)</code>로 ±π 처리</td></tr>
+</table>
+
+<h3>설정 값 (<code>locations.yaml</code> 발췌)</h3>
+<table>
+<tr><th>키</th><th>center</th><th>base_goal (map x, y, yaw)</th><th>aliases 예</th></tr>
+<tr><td><code>drinks</code></td><td>[7.65, -1.60]</td><td>[7.65, -2.82, 1.5708]</td><td>음료대, 음료 스테이션</td></tr>
+<tr><td><code>consult_2</code></td><td>[6.38, -4.43]</td><td>[5.06, -4.43, 0.0]</td><td>상담 테이블 2, 입구 쪽 상담 테이블</td></tr>
+</table>
+<p>yaw는 스테이션을 바라보는 방향(음료대 +y, 상담 테이블 +x)이다. 한국어 aliases는 <code>resolve_station</code>이 <code>drinks</code> 같은 키로 바꾼다. 스테이션의 가장자리·방향·높이는 <code>booth.yaml</code>의 stations에 따로 있다.</p>
+
+<h3>실습 명령</h3>
+<pre><code># 터미널 1: spawn 없음 = 대기 위치(home)
+./scripts/robotworld start viewer:=true rviz:=true
+
+# 터미널 2: drinks → consult_2 (음료대 → 상담 테이블 2)
+time ./scripts/robotworld exec python lessons/07_nav_pick_place/transport.py pink
+
+# 다른 컵
+time ./scripts/robotworld exec python lessons/07_nav_pick_place/transport.py blue --to consult_1
+time ./scripts/robotworld exec python lessons/07_nav_pick_place/transport.py yellow --to consult_1
+
+# 되돌려 놓기 · feedback 직접 보기
+./scripts/robotworld exec python lessons/07_nav_pick_place/transport.py pink --from consult_2 --to drinks
+./scripts/robotworld exec ros2 topic echo /pick_place/_action/feedback</code></pre>
+
+<h3>확인 포인트</h3>
+<ul>
+<li><code>transport.py</code>는 phase가 바뀐 순간에만 시각·map 위치(<code>map</code> → <code>base_footprint</code> TF, AMCL + 오도메트리)·누적 주행 거리를 출력한다. 단계별 요약으로 어느 구간이 오래 걸리는지 본다.</li>
+<li><code>consult_2</code>의 <code>base_goal</code> x를 4.9로 바꿔 도킹 시간을 비교한 뒤 5.06으로 되돌린다.</li>
+<li>마커가 안 보이거나 옆 오차가 10 cm 넘게 남으면 SkillError다. Nav2 도착 위치와 도킹 끝 위치를 RViz에서 함께 본다.</li>
+</ul>
+</section>
+
+<section class="glass card" id="s5">
+<h2>5. 정리</h2>
+<ul>
+<li>MoveIt은 SRDF의 Planning Group과 이름 자세(<code>group_state</code>)로 계획하고, <code>moveit_controllers.yaml</code>의 컨트롤러 이름 + <code>action_ns</code>로 MuJoCo 브리지 액션에 궤적을 보낸다.</li>
+<li>브리지는 궤적을 Hermite/직선 보간해 position 액추에이터에 쓰고, ± 0.035 rad · 3 s 기준으로 성공/abort를 판정한다. 계획 성공과 실행 성공은 별개다.</li>
+<li>팔과 바퀴는 인터록된다. 주행 중엔 팔 goal이 거부되고, 팔 실행 중이거나 주행 자세가 아니면 <code>/cmd_vel</code>이 0이 된다.</li>
+<li>pose goal은 IK(12회 시도, 시드와 가장 가까운 해)로 관절 목표를 만들어 ± 0.001 rad로 보낸다. Cartesian path는 <code>fraction</code> 0.9 미만이면 실행하지 않는다.</li>
+<li>그리퍼는 reached 또는 stalled면 succeed이고, 잡았는지는 멈춘 손가락 위치(16 ~ 28 mm)로 판단한다.</li>
+<li>Pick &amp; Place는 도킹(마커 서보 0.80 m → 오도메트리 0.43 m) → 정답 위치 → pre-grasp + 직선 접근 → attach → carry 순이며, 성공은 시뮬레이터 정답 위치로 판정한다.</li>
+<li>컵 배달은 같은 서버에 <code>phase="all"</code> goal 하나. Nav2는 사전 도킹 지점까지, 마커 도킹이 마지막 정밀도를 맡는다.</li>
+<li>느린 PC 대책은 마커의 찍힌 시각(sim)과 받은 시각(벽시계)을 함께 거르고, 회전 제한 시간을 sim 시간으로 재는 것이다.</li>
+</ul>
+<div class="callout ok">
+<strong>스스로 점검</strong>
+<ol>
+<li><code>arm both home</code>처럼 MoveIt 계획은 성공했는데 실행이 실패하면, 실패는 어느 단계에서 어떤 결과 코드로 전달되는가?</li>
+<li>컵을 운반할 때 이름 자세로만 이동하지 않고 Cartesian 직선으로 먼저 당기는 이유는 무엇인가?</li>
+<li>Nav2 도착 위치에 오차가 있어도 컵이 슬롯에 정확히 놓이는 이유를 <code>mdx</code> · <code>mdy</code>와 연결해 설명해 보라.</li>
+</ol>
+</div>
+</section>
+
+</main>
+<footer class="glass pager"><a href="03_slam_navigation.html">← 이전 장</a><a href="index.html">목차</a><a href="05_llm_fms_extensions.html">다음 장 →</a></footer>
+</div></body></html>
